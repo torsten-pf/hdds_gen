@@ -15,7 +15,11 @@ on:
         options:
           - release
           - debug
-
+      skip_lint:
+        description: "Skip lint (fmt + clippy)"
+        required: false
+        default: false
+        type: boolean
       run_interop:
         description: "Run C interop tests"
         required: false
@@ -36,10 +40,11 @@ env:
   PROFILE: ${{ github.event.inputs.profile || 'release' }}
 
 jobs:
-  # ── Lint (single runner) ────────────────────────────────────────
+  # ── Lint (single runner, skippable) ─────────────────────────────
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    if: github.event.inputs.skip_lint != 'true'
     steps:
       - uses: actions/checkout@v4
 
