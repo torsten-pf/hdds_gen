@@ -74,6 +74,7 @@ jobs:
   build:
     name: Build & Test (${{ matrix.target }})
     needs: lint
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -160,7 +161,7 @@ jobs:
     name: C interop tests
     needs: lint
     runs-on: ubuntu-latest
-    if: github.event.inputs.run_interop != 'false'
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_interop != 'false') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -188,6 +189,7 @@ jobs:
   docs:
     name: Documentation
     needs: lint
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
