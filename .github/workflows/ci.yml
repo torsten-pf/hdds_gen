@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  #push:
+  #  branches: [master, main]
+  #pull_request:
+  #  branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+      run_interop:
+        description: "Run C interop tests"
+        required: false
+        default: true
+        type: boolean
+      features:
+        description: "Extra features (comma-separated, e.g. interfaces)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Map the workflow_dispatch profile input (default to release for push/PR)
+  PROFILE: ${{ github.event.inputs.profile || 'release' }}
+
+jobs:
+  # ── Lint (single runner) ────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: lint-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all --all-targets -- -D warnings
+
+      - name: Clippy (interfaces feature)
+        run: cargo clippy --all --all-targets --features interfaces -- -D warnings
+
+  # ── Build + test matrix ─────────────────────────────────────────
+  build:
+    name: Build & Test (${{ matrix.target }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: hddsgen
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: hddsgen
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: hddsgen.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # ── Build ──
+      - name: Build (${{ env.PROFILE }})
+        run: cargo build --${{ env.PROFILE == 'release' && 'release' || '' }} --target ${{ matrix.target }}
+        if: env.PROFILE == 'release'
+
+      - name: Build (debug)
+        run: cargo build --target ${{ matrix.target }}
+        if: env.PROFILE != 'release'
+
+      - name: Build with interfaces (${{ env.PROFILE }})
+        run: cargo build ${{ env.PROFILE == 'release' && '--release' || '' }} --target ${{ matrix.target }} --features interfaces
+
+      # ── Extra features from dispatch ──
+      - name: Build with extra features
+        if: github.event.inputs.features != ''
+        run: cargo build ${{ env.PROFILE == 'release' && '--release' || '' }} --target ${{ matrix.target }} --features "${{ github.event.inputs.features }}"
+
+      # ── Tests ──
+      - name: Test (default features)
+        run: cargo test --all --target ${{ matrix.target }}
+
+      - name: Test (interfaces feature)
+        run: cargo test --all --target ${{ matrix.target }} --features interfaces
+
+      # ── Smoke test ──
+      - name: Smoke test CLI
+        run: cargo run ${{ env.PROFILE == 'release' && '--release' || '' }} --target ${{ matrix.target }} --bin hddsgen -- --help
+
+      # ── Upload binary artifact ──
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hddsgen-${{ matrix.target }}
+          path: target/${{ matrix.target }}/${{ env.PROFILE == 'release' && 'release' || 'debug' }}/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── Upload library artifacts (Linux only) ──
+      - name: Upload library
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libhddsgen-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/${{ env.PROFILE == 'release' && 'release' || 'debug' }}/libhddsgen.rlib
+            target/${{ matrix.target }}/${{ env.PROFILE == 'release' && 'release' || 'debug' }}/libhddsgen.so
+            target/${{ matrix.target }}/${{ env.PROFILE == 'release' && 'release' || 'debug' }}/libhddsgen.a
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── C interop tests ─────────────────────────────────────────────
+  interop:
+    name: C interop tests
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event.inputs.run_interop != 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install C compilers
+        run: sudo apt-get update && sudo apt-get install -y gcc clang
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: interop-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: interop-cargo-
+
+      - name: Build hddsgen binary
+        run: cargo build --bin hddsgen
+
+      - name: Run C interop tests
+        run: cargo test --test interop_c --test interop_c_ext -- --nocapture
+
+  # ── Documentation ───────────────────────────────────────────────
+  docs:
+    name: Documentation
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features
+
+      - name: Upload docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc
+          path: target/doc
+          retention-days: 14
