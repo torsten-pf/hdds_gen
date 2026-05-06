@@ -49,85 +49,96 @@ impl RustGenerator {
 
         push_fmt(&mut output, format_args!("{indent}}}\n\n"));
 
-        // Generate Cdr2Encode implementation
-        push_fmt(
-            &mut output,
-            format_args!("{indent}impl Cdr2Encode for {name} {{\n"),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}    fn encode_cdr2_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
-            ),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}        if dst.len() < 4 {{ return Err(CdrError::BufferTooSmall); }}\n"
-            ),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}        dst[..4].copy_from_slice(&(*self as u32).to_le_bytes());\n"
-            ),
-        );
-        push_fmt(&mut output, format_args!("{indent}        Ok(4)\n"));
-        push_fmt(&mut output, format_args!("{indent}    }}\n"));
-        push_fmt(
-            &mut output,
-            format_args!("{indent}    fn max_cdr2_size(&self) -> usize {{ 4 }}\n"),
-        );
-        push_fmt(&mut output, format_args!("{indent}}}\n\n"));
-
-        // Generate Cdr2Decode implementation
-        push_fmt(
-            &mut output,
-            format_args!("{indent}impl Cdr2Decode for {name} {{\n"),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
-            ),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}        if src.len() < 4 {{ return Err(CdrError::UnexpectedEof); }}\n"
-            ),
-        );
-        push_fmt(
-            &mut output,
-            format_args!(
-                "{indent}        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);\n"
-            ),
-        );
-        push_fmt(&mut output, format_args!("{indent}        match v {{\n"));
-
-        for variant in &e.variants {
-            // @audit-ok: safe cast - enum variant index always << i64::MAX
-            #[allow(clippy::cast_possible_wrap)]
-            let val = variant.value.unwrap_or_else(|| {
-                e.variants
-                    .iter()
-                    .position(|v| v.name == variant.name)
-                    .unwrap_or(0) as i64
-            });
-            let vname = &variant.name;
+        // 2.2-c: emit inherent `encode_xcdrN_le` / `max_xcdrN_size` /
+        // `decode_xcdrN_le` methods plus a Cdr2Encode / Cdr2Decode trait
+        // delegator so outer types -- which in 2.2-d started dispatching
+        // sub-field encoders via `.encode_xcdrN_le(...)` -- can reach the
+        // enum locally. The wire encoding itself is version-invariant
+        // here: hddsgen currently emits every enum as a 32-bit integer
+        // (`#[repr(u32)]` + 4-byte LE payload), which aligns to 4 in both
+        // XCDR v1 (Table 31) and XCDR v2 (same, since <= maxalign=4).
+        // The two inherent methods therefore share the same body, but are
+        // both emitted to preserve the "every type offers both versions"
+        // invariant established in 2.2-a.
+        for &version in super::helpers::VERSIONS_TO_EMIT {
+            let suffix = super::helpers::xcdr_method_suffix(version);
+            push_fmt(&mut output, format_args!("{indent}impl {name} {{\n"));
             push_fmt(
                 &mut output,
-                format_args!("{indent}            {val} => Ok((Self::{vname}, 4)),\n"),
+                format_args!(
+                    "{indent}    pub fn encode_{suffix}_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
+                ),
             );
+            push_fmt(
+                &mut output,
+                format_args!(
+                    "{indent}        if dst.len() < 4 {{ return Err(CdrError::BufferTooSmall); }}\n"
+                ),
+            );
+            push_fmt(
+                &mut output,
+                format_args!(
+                    "{indent}        dst[..4].copy_from_slice(&(*self as u32).to_le_bytes());\n"
+                ),
+            );
+            push_fmt(&mut output, format_args!("{indent}        Ok(4)\n"));
+            push_fmt(&mut output, format_args!("{indent}    }}\n"));
+            push_fmt(
+                &mut output,
+                format_args!("{indent}    pub fn max_{suffix}_size(&self) -> usize {{ 4 }}\n"),
+            );
+            push_fmt(
+                &mut output,
+                format_args!(
+                    "{indent}    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+                ),
+            );
+            push_fmt(
+                &mut output,
+                format_args!(
+                    "{indent}        if src.len() < 4 {{ return Err(CdrError::UnexpectedEof); }}\n"
+                ),
+            );
+            push_fmt(
+                &mut output,
+                format_args!(
+                    "{indent}        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);\n"
+                ),
+            );
+            push_fmt(&mut output, format_args!("{indent}        match v {{\n"));
+            for variant in &e.variants {
+                #[allow(clippy::cast_possible_wrap)]
+                let val = variant.value.unwrap_or_else(|| {
+                    e.variants
+                        .iter()
+                        .position(|v| v.name == variant.name)
+                        .unwrap_or(0) as i64
+                });
+                let vname = &variant.name;
+                push_fmt(
+                    &mut output,
+                    format_args!("{indent}            {val} => Ok((Self::{vname}, 4)),\n"),
+                );
+            }
+            push_fmt(
+                &mut output,
+                format_args!("{indent}            _ => Err(CdrError::InvalidEncoding),\n"),
+            );
+            push_fmt(&mut output, format_args!("{indent}        }}\n"));
+            push_fmt(&mut output, format_args!("{indent}    }}\n"));
+            push_fmt(&mut output, format_args!("{indent}}}\n\n"));
         }
 
+        // Trait delegator (primary = Xcdr2 always for enums: no
+        // @data_representation annotation is parsed onto enums today, and
+        // the body is version-invariant anyway, so the choice is cosmetic).
         push_fmt(
             &mut output,
-            format_args!("{indent}            _ => Err(CdrError::InvalidEncoding),\n"),
+            format_args!(
+                "{}",
+                Self::emit_cdr_trait_delegator(name, super::helpers::CdrVersion::Xcdr2)
+            ),
         );
-        push_fmt(&mut output, format_args!("{indent}        }}\n"));
-        push_fmt(&mut output, format_args!("{indent}    }}\n"));
-        push_fmt(&mut output, format_args!("{indent}}}\n\n"));
 
         output
     }

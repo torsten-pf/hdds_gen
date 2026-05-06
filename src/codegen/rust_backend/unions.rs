@@ -7,7 +7,7 @@
 //! with `Cdr2Encode`/`Cdr2Decode` implementations.
 
 use super::helpers::to_pascal_case;
-use super::{push_fmt, RustGenerator};
+use super::{push_fmt, CdrVersion, RustGenerator};
 use crate::ast::{Union, UnionCase, UnionLabel};
 use crate::types::{Annotation, IdlType, PrimitiveType};
 
@@ -89,11 +89,18 @@ impl RustGenerator {
             push_fmt(&mut output, format_args!("{indent}}}\n\n"));
         }
 
-        // Generate Cdr2Encode impl
-        output.push_str(&Self::emit_union_encode(u, &indent));
-
-        // Generate Cdr2Decode impl
-        output.push_str(&Self::emit_union_decode(u, &indent));
+        // Dual emission for unions, same pattern as structs: inherent
+        // `encode_xcdrN_le` / `decode_xcdrN_le` methods for each version in
+        // `VERSIONS_TO_EMIT`, then a `Cdr2Encode` / `Cdr2Decode` trait
+        // delegator pointing at the primary version selected by the
+        // `@data_representation` annotation.
+        let repr = super::helpers::data_representation_annotation(&u.annotations);
+        let primary = super::helpers::primary_version(repr.as_deref());
+        for &version in super::helpers::VERSIONS_TO_EMIT {
+            output.push_str(&Self::emit_union_encode(u, &indent, version));
+            output.push_str(&Self::emit_union_decode(u, &indent, version));
+        }
+        output.push_str(&Self::emit_cdr_trait_delegator(&u.name, primary));
 
         output
     }
@@ -127,19 +134,24 @@ impl RustGenerator {
         }
     }
 
-    /// Generate `Cdr2Encode` implementation for a union
-    fn emit_union_encode(u: &Union, indent: &str) -> String {
+    /// Generate an inherent `encode_xcdrN_le` method on `impl UnionName {}`.
+    ///
+    /// 2.2-c: same pattern as `emit_cdr2_encode_impl` for structs --
+    /// dual-emitted from `generate_union` (once per version in
+    /// [`super::helpers::VERSIONS_TO_EMIT`]) plus a `Cdr2Encode` trait
+    /// delegator added afterwards. The function name now carries the
+    /// version suffix so outer types can dispatch deterministically on
+    /// the negotiated wire representation.
+    fn emit_union_encode(u: &Union, indent: &str, version: CdrVersion) -> String {
         let mut code = String::new();
         let name = &u.name;
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
-        push_fmt(
-            &mut code,
-            format_args!("{indent}impl Cdr2Encode for {name} {{\n"),
-        );
+        push_fmt(&mut code, format_args!("{indent}impl {name} {{\n"));
         push_fmt(
             &mut code,
             format_args!(
-                "{indent}    fn encode_cdr2_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
+                "{indent}    pub fn encode_{suffix}_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
             ),
         );
         push_fmt(
@@ -201,7 +213,8 @@ impl RustGenerator {
             );
 
             // Encode value
-            let value_encode = Self::emit_union_value_encode(&case.field.field_type, "v", indent);
+            let value_encode =
+                Self::emit_union_value_encode(&case.field.field_type, "v", indent, version);
             code.push_str(&value_encode);
 
             push_fmt(&mut code, format_args!("{indent}            }}\n"));
@@ -211,10 +224,10 @@ impl RustGenerator {
         push_fmt(&mut code, format_args!("{indent}        Ok(offset)\n"));
         push_fmt(&mut code, format_args!("{indent}    }}\n\n"));
 
-        // max_cdr2_size
+        // max size
         push_fmt(
             &mut code,
-            format_args!("{indent}    fn max_cdr2_size(&self) -> usize {{\n"),
+            format_args!("{indent}    pub fn max_{suffix}_size(&self) -> usize {{\n"),
         );
         push_fmt(
             &mut code,
@@ -240,19 +253,19 @@ impl RustGenerator {
         code
     }
 
-    /// Generate `Cdr2Decode` implementation for a union
-    fn emit_union_decode(u: &Union, indent: &str) -> String {
+    /// Generate an inherent `decode_xcdrN_le` method on `impl UnionName {}`.
+    ///
+    /// See [`Self::emit_union_encode`] for the overall 2.2-c design.
+    fn emit_union_decode(u: &Union, indent: &str, version: CdrVersion) -> String {
         let mut code = String::new();
         let name = &u.name;
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
-        push_fmt(
-            &mut code,
-            format_args!("{indent}impl Cdr2Decode for {name} {{\n"),
-        );
+        push_fmt(&mut code, format_args!("{indent}impl {name} {{\n"));
         push_fmt(
             &mut code,
             format_args!(
-                "{indent}    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+                "{indent}    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
             ),
         );
         push_fmt(
@@ -328,7 +341,8 @@ impl RustGenerator {
             }
 
             // Decode value
-            let value_decode = Self::emit_union_value_decode(&case.field.field_type, indent);
+            let value_decode =
+                Self::emit_union_value_decode(&case.field.field_type, indent, version);
             code.push_str(&value_decode);
             push_fmt(
                 &mut code,
@@ -509,9 +523,15 @@ impl RustGenerator {
     }
 
     /// Emit encode code for a union value
-    fn emit_union_value_encode(ty: &IdlType, var: &str, indent: &str) -> String {
+    fn emit_union_value_encode(
+        ty: &IdlType,
+        var: &str,
+        indent: &str,
+        version: CdrVersion,
+    ) -> String {
         let mut code = String::new();
-        let alignment = Self::cdr2_alignment(ty);
+        let alignment = Self::xcdr_alignment(ty, version);
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
         if alignment > 1 {
             push_fmt(
@@ -537,11 +557,14 @@ impl RustGenerator {
                 code.push('\n');
             }
             IdlType::Named(_) => {
-                // Nested type - call its encode
+                // Nested type - call the versioned inherent encoder on the
+                // sub-type so the outer union's XCDR version flows into the
+                // sub (2.2-c critical fix: same transitional bug the
+                // containers fixed in 2.2-d, but for union cases).
                 push_fmt(
                     &mut code,
                     format_args!(
-                        "{indent}                let n = {var}.encode_cdr2_le(&mut dst[offset..])?;\n"
+                        "{indent}                let n = {var}.encode_{suffix}_le(&mut dst[offset..])?;\n"
                     ),
                 );
                 push_fmt(
@@ -572,8 +595,12 @@ impl RustGenerator {
                     &mut code,
                     format_args!("{indent}                for item in {var}.iter() {{\n"),
                 );
-                let inner_encode =
-                    Self::emit_union_value_encode(inner, "item", &format!("{indent}    "));
+                let inner_encode = Self::emit_union_value_encode(
+                    inner,
+                    "item",
+                    &format!("{indent}    "),
+                    version,
+                );
                 code.push_str(&inner_encode);
                 push_fmt(&mut code, format_args!("{indent}                }}\n"));
             }
@@ -586,6 +613,7 @@ impl RustGenerator {
                     inner,
                     &format!("&{var}[i]"),
                     &format!("{indent}    "),
+                    version,
                 );
                 code.push_str(&inner_encode);
                 push_fmt(&mut code, format_args!("{indent}                }}\n"));
@@ -604,9 +632,10 @@ impl RustGenerator {
     }
 
     /// Emit decode code for a union value
-    fn emit_union_value_decode(ty: &IdlType, indent: &str) -> String {
+    fn emit_union_value_decode(ty: &IdlType, indent: &str, version: CdrVersion) -> String {
         let mut code = String::new();
-        let alignment = Self::cdr2_alignment(ty);
+        let alignment = Self::xcdr_alignment(ty, version);
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
         if alignment > 1 {
             push_fmt(
@@ -634,10 +663,12 @@ impl RustGenerator {
                 );
             }
             IdlType::Named(name) => {
+                // Same 2.2-c critical fix as `emit_union_value_encode`: route
+                // the sub-type decoder on the outer's XCDR version.
                 push_fmt(
                     &mut code,
                     format_args!(
-                        "{indent}                let (val, n) = {name}::decode_cdr2_le(&src[offset..])?;\n"
+                        "{indent}                let (val, n) = {name}::decode_{suffix}_le(&src[offset..])?;\n"
                     ),
                 );
                 push_fmt(
@@ -670,7 +701,8 @@ impl RustGenerator {
                     &mut code,
                     format_args!("{indent}                for _ in 0..len {{\n"),
                 );
-                let inner_decode = Self::emit_union_value_decode(inner, &format!("{indent}    "));
+                let inner_decode =
+                    Self::emit_union_value_decode(inner, &format!("{indent}    "), version);
                 // Extract just the val assignment from inner decode
                 code.push_str(&inner_decode.replace("let val", "let item"));
                 push_fmt(

@@ -34,23 +34,58 @@ impl RustGenerator {
             "        let base = Self::pow10();\n        let neg = self.0 < 0;\n        let mut v = if neg { -self.0 } else { self.0 };\n        let intp = v / base;\n        let fracp = (v % base) as u128;\n        if S == 0 { if neg { write!(f, \"-{}\", intp) } else { write!(f, \"{}\", intp) } } else { let width = S as usize; if neg { write!(f, \"-{}.{:0width$}\", intp, fracp) } else { write!(f, \"{}.{:0width$}\", intp, fracp) } }\n    }\n}",
         );
         output.push('\n');
+        // 2.2-c: emit inherent `encode_xcdrN_le` / `decode_xcdrN_le` on
+        // `Fixed<D, S>` so outer struct and union codegen can dispatch
+        // sub-field calls via the versioned name regardless of wire format.
+        // Fixed is version-invariant on the wire: hddsgen always encodes it
+        // as 16 raw bytes via `self.raw().to_le_bytes()`, aligned to 4 by
+        // the outer (`xcdr_alignment` reports 4 for `PrimitiveType::Fixed`
+        // in both XCDR v1 and XCDR v2), so the two inherent bodies share
+        // the same implementation. The `Cdr2Encode` / `Cdr2Decode` trait
+        // delegators are emitted manually below (they can't go through
+        // `RustGenerator::emit_cdr_trait_delegator` because `Fixed<D, S>`
+        // carries const generics that helper does not format).
+        for (suffix, _version) in [
+            ("xcdr1", "Xcdr1"),
+            ("xcdr2", "Xcdr2"),
+        ] {
+            output.push_str("impl<const D: u32, const S: u32> Fixed<D, S> {\n");
+            output.push_str(&format!(
+                "    pub fn encode_{suffix}_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
+            ));
+            output.push_str(
+                "        if dst.len() < 16 { return Err(CdrError::BufferTooSmall); }\n",
+            );
+            output.push_str("        dst[..16].copy_from_slice(&self.raw().to_le_bytes());\n");
+            output.push_str("        Ok(16)\n");
+            output.push_str("    }\n");
+            output.push_str(&format!(
+                "    pub fn max_{suffix}_size(&self) -> usize {{ 16 }}\n"
+            ));
+            output.push_str(&format!(
+                "    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+            ));
+            output.push_str("        if src.len() < 16 { return Err(CdrError::UnexpectedEof); }\n");
+            output.push_str(
+                "        let raw = {\n            let mut __hdds_tmp = [0u8; 16];\n            __hdds_tmp.copy_from_slice(&src[..16]);\n            i128::from_le_bytes(__hdds_tmp)\n        };\n",
+            );
+            output.push_str("        Ok((Fixed::<D, S>::from_raw(raw), 16))\n");
+            output.push_str("    }\n");
+            output.push_str("}\n\n");
+        }
+
+        // Manual Cdr2Encode / Cdr2Decode delegators for the generic Fixed<D, S>.
         output.push_str("impl<const D: u32, const S: u32> Cdr2Encode for Fixed<D, S> {\n");
         output.push_str(
             "    fn encode_cdr2_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {\n",
         );
-        output.push_str("        if dst.len() < 16 { return Err(CdrError::BufferTooSmall); }\n");
-        output.push_str("        dst[..16].copy_from_slice(&self.raw().to_le_bytes());\n");
-        output.push_str("        Ok(16)\n");
+        output.push_str("        self.encode_xcdr2_le(dst)\n");
         output.push_str("    }\n");
-        output.push_str("    fn max_cdr2_size(&self) -> usize { 16 }\n");
+        output.push_str("    fn max_cdr2_size(&self) -> usize { self.max_xcdr2_size() }\n");
         output.push_str("}\n\n");
         output.push_str("impl<const D: u32, const S: u32> Cdr2Decode for Fixed<D, S> {\n");
         output.push_str("    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {\n");
-        output.push_str("        if src.len() < 16 { return Err(CdrError::UnexpectedEof); }\n");
-        output.push_str(
-            "        let raw = {\n            let mut __hdds_tmp = [0u8; 16];\n            __hdds_tmp.copy_from_slice(&src[..16]);\n            i128::from_le_bytes(__hdds_tmp)\n        };\n",
-        );
-        output.push_str("        Ok((Fixed::<D, S>::from_raw(raw), 16))\n");
+        output.push_str("        Self::decode_xcdr2_le(src)\n");
         output.push_str("    }\n");
         output.push_str("}\n");
         output.push('\n');

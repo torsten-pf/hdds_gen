@@ -151,65 +151,86 @@ impl RustGenerator {
     fn emit_bitset_cdr2_impls(&self, dst: &mut String, b: &Bitset) {
         let indent = self.indent();
         let name = &b.name;
-        // Cdr2Encode
-        push_fmt(
-            dst,
-            format_args!("\n{indent}impl Cdr2Encode for {name} {{\n"),
-        );
-        push_fmt(
-            dst,
-            format_args!(
-                "{indent}    fn encode_cdr2_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
-            ),
-        );
-        push_fmt(dst, format_args!("{indent}        if dst.len() < 8 {{\n"));
-        push_fmt(
-            dst,
-            format_args!("{indent}            return Err(CdrError::BufferTooSmall);\n"),
-        );
-        push_fmt(dst, format_args!("{indent}        }}\n"));
-        push_fmt(
-            dst,
-            format_args!("{indent}        dst[..8].copy_from_slice(&self.bits.to_le_bytes());\n"),
-        );
-        push_fmt(dst, format_args!("{indent}        Ok(8)\n"));
-        push_fmt(dst, format_args!("{indent}    }}\n"));
-        push_fmt(
-            dst,
-            format_args!("{indent}    fn max_cdr2_size(&self) -> usize {{ 8 }}\n"),
-        );
-        push_fmt(dst, format_args!("{indent}}}\n"));
-        // Cdr2Decode
-        push_fmt(
-            dst,
-            format_args!("\n{indent}impl Cdr2Decode for {name} {{\n"),
-        );
-        push_fmt(
-            dst,
-            format_args!(
-                "{indent}    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
-            ),
-        );
-        push_fmt(dst, format_args!("{indent}        if src.len() < 8 {{\n"));
-        push_fmt(
-            dst,
-            format_args!("{indent}            return Err(CdrError::UnexpectedEof);\n"),
-        );
-        push_fmt(dst, format_args!("{indent}        }}\n"));
-        push_fmt(
-            dst,
-            format_args!("{indent}        let mut bytes = [0u8; 8];\n"),
-        );
-        push_fmt(
-            dst,
-            format_args!("{indent}        bytes.copy_from_slice(&src[..8]);\n"),
-        );
-        push_fmt(
-            dst,
-            format_args!("{indent}        Ok((Self {{ bits: u64::from_le_bytes(bytes) }}, 8))\n"),
-        );
-        push_fmt(dst, format_args!("{indent}    }}\n"));
-        push_fmt(dst, format_args!("{indent}}}\n"));
+        // 2.2-c: hddsgen emits every bitset with a u64 storage regardless of
+        // the declared bit-bound (8-byte payload, `dst[..8]`), so the wire
+        // encoding is version-invariant from the bitset's own perspective:
+        // the outer struct is responsible for aligning the 8 bytes before
+        // calling the bitset encoder, and that outer alignment is handled
+        // by the struct codegen (`xcdr_alignment` treats Named = 4 in both
+        // versions, which matches the XCDR2 MALIGN cap; the wire u64 payload
+        // is then placed at whatever offset the outer reached).
+        //
+        // Both inherent methods therefore share the same body, but both are
+        // emitted to preserve the "every type offers encode_xcdrN_le" rule.
+        // When a future codegen decision splits bitset storage by bit-bound
+        // (e.g. @bit_bound(64) staying u64 but @bit_bound(32) shrinking to
+        // u32 with 4-byte payload), this helper will need per-version
+        // divergence; flag inline as a TODO until the split lands.
+        for &version in super::helpers::VERSIONS_TO_EMIT {
+            let suffix = super::helpers::xcdr_method_suffix(version);
+            push_fmt(dst, format_args!("\n{indent}impl {name} {{\n"));
+            push_fmt(
+                dst,
+                format_args!(
+                    "{indent}    pub fn encode_{suffix}_le(&self, dst: &mut [u8]) -> Result<usize, CdrError> {{\n"
+                ),
+            );
+            push_fmt(dst, format_args!("{indent}        if dst.len() < 8 {{\n"));
+            push_fmt(
+                dst,
+                format_args!("{indent}            return Err(CdrError::BufferTooSmall);\n"),
+            );
+            push_fmt(dst, format_args!("{indent}        }}\n"));
+            push_fmt(
+                dst,
+                format_args!(
+                    "{indent}        dst[..8].copy_from_slice(&self.bits.to_le_bytes());\n"
+                ),
+            );
+            push_fmt(dst, format_args!("{indent}        Ok(8)\n"));
+            push_fmt(dst, format_args!("{indent}    }}\n"));
+            push_fmt(
+                dst,
+                format_args!("{indent}    pub fn max_{suffix}_size(&self) -> usize {{ 8 }}\n"),
+            );
+            push_fmt(
+                dst,
+                format_args!(
+                    "{indent}    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+                ),
+            );
+            push_fmt(dst, format_args!("{indent}        if src.len() < 8 {{\n"));
+            push_fmt(
+                dst,
+                format_args!("{indent}            return Err(CdrError::UnexpectedEof);\n"),
+            );
+            push_fmt(dst, format_args!("{indent}        }}\n"));
+            push_fmt(
+                dst,
+                format_args!("{indent}        let mut bytes = [0u8; 8];\n"),
+            );
+            push_fmt(
+                dst,
+                format_args!("{indent}        bytes.copy_from_slice(&src[..8]);\n"),
+            );
+            push_fmt(
+                dst,
+                format_args!(
+                    "{indent}        Ok((Self {{ bits: u64::from_le_bytes(bytes) }}, 8))\n"
+                ),
+            );
+            push_fmt(dst, format_args!("{indent}    }}\n"));
+            push_fmt(dst, format_args!("{indent}}}\n"));
+        }
+
+        // Trait delegator (primary = Xcdr2 always: the body is version-
+        // invariant today, so the choice only affects which inherent method
+        // `Cdr2Encode::encode_cdr2_le` delegates to -- cosmetic).
+        dst.push('\n');
+        dst.push_str(&Self::emit_cdr_trait_delegator(
+            name,
+            super::helpers::CdrVersion::Xcdr2,
+        ));
     }
 
     fn emit_bitset_common_helpers(&self, dst: &mut String) {

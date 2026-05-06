@@ -317,6 +317,93 @@ fn data_representation_on_member_is_error() {
     }));
 }
 
+#[test]
+fn data_representation_xcdr1_on_mutable_struct_is_error() {
+    // @mutable + @data_representation(XCDR1) asks for PL_CDR v1 wire, which is
+    // out of scope of the XCDR1 WIP. The parser should reject it up front so
+    // codegen does not silently fall back to XCDR2.
+    let input = r#"
+        @mutable
+        @data_representation(XCDR1)
+        struct M { int32_t a; };
+    "#;
+    let ast = parse_idl(input);
+    let diags = validate(&ast);
+    assert!(
+        diags.iter().any(|d| {
+            matches!(d.level, Level::Error)
+                && d.message.contains("@data_representation(XCDR1)")
+                && d.message.contains("@mutable")
+        }),
+        "expected rejection diag, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn data_representation_plain_cdr_on_mutable_struct_is_error() {
+    // PLAIN_CDR is the XCDR v1 encoding -- same rejection as XCDR1.
+    let input = r#"
+        @mutable
+        @data_representation(PLAIN_CDR)
+        struct M { int32_t a; };
+    "#;
+    let ast = parse_idl(input);
+    let diags = validate(&ast);
+    assert!(
+        diags.iter().any(|d| {
+            matches!(d.level, Level::Error)
+                && d.message.contains("@data_representation(PLAIN_CDR)")
+                && d.message.contains("@mutable")
+        }),
+        "expected rejection diag, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn data_representation_xcdr2_on_mutable_struct_is_ok() {
+    // @mutable + XCDR2 is the expected supported combination (PL_CDR2 wire).
+    let input = r#"
+        @mutable
+        @data_representation(XCDR2)
+        struct M { int32_t a; };
+    "#;
+    let ast = parse_idl(input);
+    let diags = validate(&ast);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| matches!(d.level, Level::Error)
+                && d.message.contains("@data_representation")
+                && d.message.contains("@mutable")),
+        "unexpected mutable-vs-XCDR2 diag: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn data_representation_xcdr1_on_mutable_union_is_error() {
+    // The same rule applies to `@mutable union` -- unions share the PL_CDR2
+    // rewire, so pinning them to XCDR1 is equally unsupported.
+    let input = r#"
+        @mutable
+        @data_representation(XCDR1)
+        union U switch(long) { case 0: int32_t a; default: int32_t b; };
+    "#;
+    let ast = parse_idl(input);
+    let diags = validate(&ast);
+    assert!(
+        diags.iter().any(|d| {
+            matches!(d.level, Level::Error)
+                && d.message.contains("@data_representation(XCDR1)")
+                && d.message.contains("@mutable")
+        }),
+        "expected rejection diag, got: {:?}",
+        diags
+    );
+}
+
 #[cfg(feature = "interfaces")]
 #[test]
 fn interface_oneway_must_return_void_and_no_raises() {

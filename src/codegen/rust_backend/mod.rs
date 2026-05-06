@@ -27,6 +27,7 @@ mod unions;
 mod tests;
 
 pub(crate) use helpers::push_fmt;
+pub(super) use helpers::CdrVersion;
 use helpers::uses_fixed;
 
 /// Serde rename style for JSON serialization

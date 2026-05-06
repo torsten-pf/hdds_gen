@@ -78,6 +78,30 @@ pub(super) fn enforce_extensibility_conflicts(
             message: format!("{who}: conflicting extensibility annotations (found: {kinds:?})"),
         });
     }
+
+    // `@mutable` types are wire-encoded as PL_CDR2 in XCDR v2. The matching
+    // XCDR v1 wire (PL_CDR v1: per-member PID uint16 + length uint16 header,
+    // sentinel-terminated parameter list) is explicitly out of scope of the
+    // current XCDR1 WIP, so pinning a `@mutable` type to XCDR1 via
+    // `@data_representation("XCDR1")` or the equivalent `"PLAIN_CDR"` asks
+    // the codegen for a wire format it cannot produce. Reject at parse time
+    // so the user sees the error before they hit codegen.
+    if kinds.contains(&EK::Mutable) {
+        for a in anns {
+            if let Annotation::DataRepresentation(val) = a {
+                let check = val.to_ascii_uppercase();
+                if check == "XCDR1" || check == "PLAIN_CDR" {
+                    diags.push(ValidationDiag {
+                        level: Level::Error,
+                        message: format!(
+                            "{who}: @data_representation({val}) is not supported on @mutable types \
+                             (PL_CDR v1 is out of scope; use XCDR2 or PLAIN_CDR2)"
+                        ),
+                    });
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn validate_type_usage(

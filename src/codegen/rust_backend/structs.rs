@@ -6,7 +6,7 @@
 //! Generates Rust struct definitions from IDL struct types.
 
 use super::super::keywords::rust_ident;
-use super::{push_fmt, RustGenerator};
+use super::{push_fmt, CdrVersion, RustGenerator};
 use crate::ast::{Field, Struct};
 use crate::types::{Annotation, IdlType, PrimitiveType};
 
@@ -67,8 +67,29 @@ impl RustGenerator {
         }
 
         push_fmt(&mut output, format_args!("{indent}}}\n\n"));
-        output.push_str(&Self::emit_cdr2_encode_impl(s, enum_names));
-        output.push_str(&Self::emit_cdr2_decode_impl(s, enum_names));
+        // Every struct emits inherent `encode_xcdrN_le` / `decode_xcdrN_le`
+        // methods plus a `Cdr2Encode` / `Cdr2Decode` trait delegator that
+        // routes to the primary version chosen by `@data_representation`:
+        //
+        // - `@final` / default (non-mutable non-compact): dual emission, one
+        //   call per version in `VERSIONS_TO_EMIT`; delegator targets
+        //   `primary_version` (XCDR1 / PLAIN_CDR -> Xcdr1, otherwise Xcdr2).
+        // - `@mutable` / compact-mutable (PL_CDR2 wire format): single Xcdr2
+        //   emission; PL_CDR v1 is not supported. `@data_representation(XCDR1)`
+        //   on a mutable type is rejected at parse time by the validator.
+        if super::helpers::is_mutable_struct(s) || super::helpers::is_compact_mutable_struct(s) {
+            output.push_str(&Self::emit_cdr2_encode_impl(s, enum_names, CdrVersion::Xcdr2));
+            output.push_str(&Self::emit_cdr2_decode_impl(s, enum_names, CdrVersion::Xcdr2));
+            output.push_str(&Self::emit_cdr_trait_delegator(&s.name, CdrVersion::Xcdr2));
+        } else {
+            let repr = super::helpers::data_representation_annotation(&s.annotations);
+            let primary = super::helpers::primary_version(repr.as_deref());
+            for &version in super::helpers::VERSIONS_TO_EMIT {
+                output.push_str(&Self::emit_cdr2_encode_impl(s, enum_names, version));
+                output.push_str(&Self::emit_cdr2_decode_impl(s, enum_names, version));
+            }
+            output.push_str(&Self::emit_cdr_trait_delegator(&s.name, primary));
+        }
         let is_nested = s
             .annotations
             .iter()

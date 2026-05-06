@@ -7,12 +7,18 @@
 
 #![allow(clippy::uninlined_format_args)]
 
-use super::{push_fmt, RustGenerator};
+use super::{push_fmt, CdrVersion, RustGenerator};
 use crate::types::{IdlType, PrimitiveType};
 
 impl RustGenerator {
     #[allow(clippy::too_many_lines, clippy::branches_sharing_code)]
-    pub(super) fn append_decode_sequence(dst: &mut String, field_name: &str, inner: &IdlType) {
+    pub(super) fn append_decode_sequence(
+        dst: &mut String,
+        field_name: &str,
+        inner: &IdlType,
+        version: CdrVersion,
+    ) {
+        let suffix = super::helpers::xcdr_method_suffix(version);
         push_fmt(
             dst,
             format_args!("        // Decode sequence field '{field_name}'\n"),
@@ -96,7 +102,7 @@ impl RustGenerator {
                     push_fmt(
                         dst,
                         format_args!(
-                            "            let (elem, used) = <{rust_type}>::decode_cdr2_le(&src[offset..])?;\n"
+                            "            let (elem, used) = <{rust_type}>::decode_{suffix}_le(&src[offset..])?;\n"
                         ),
                     );
                     dst.push_str("            let advance = usize::min(elem_len, used);\n");
@@ -107,7 +113,7 @@ impl RustGenerator {
                     push_fmt(
                         dst,
                         format_args!(
-                            "            let (elem, used) = <{rust_type}>::decode_cdr2_le(&src[offset..])?;\n"
+                            "            let (elem, used) = <{rust_type}>::decode_{suffix}_le(&src[offset..])?;\n"
                         ),
                     );
                     dst.push_str("            offset += used;\n");
@@ -119,7 +125,7 @@ impl RustGenerator {
                 push_fmt(
                     dst,
                     format_args!(
-                        "            let (elem, used) = <{rust_type}>::decode_cdr2_le(&src[offset..])?;\n"
+                        "            let (elem, used) = <{rust_type}>::decode_{suffix}_le(&src[offset..])?;\n"
                     ),
                 );
                 dst.push_str("            offset += used;\n");
@@ -134,6 +140,7 @@ impl RustGenerator {
         field_name: &str,
         inner: &IdlType,
         size: u32,
+        version: CdrVersion,
     ) {
         push_fmt(
             dst,
@@ -143,7 +150,7 @@ impl RustGenerator {
         if let Some(elem_size) = Self::is_primitive_like(inner) {
             Self::append_decode_array_primitive(dst, field_name, inner, size, elem_size);
         } else {
-            Self::append_decode_array_dynamic(dst, field_name, inner, size);
+            Self::append_decode_array_dynamic(dst, field_name, inner, size, version);
         }
     }
 
@@ -181,7 +188,14 @@ impl RustGenerator {
         );
     }
 
-    fn append_decode_array_dynamic(dst: &mut String, field_name: &str, inner: &IdlType, size: u32) {
+    fn append_decode_array_dynamic(
+        dst: &mut String,
+        field_name: &str,
+        inner: &IdlType,
+        size: u32,
+        version: CdrVersion,
+    ) {
+        let suffix = super::helpers::xcdr_method_suffix(version);
         push_fmt(
             dst,
             format_args!("        let mut {field_name} = Vec::with_capacity({size});\n"),
@@ -222,7 +236,7 @@ impl RustGenerator {
             push_fmt(
                 dst,
                 format_args!(
-                    "            let (elem, used) = <{rust_type}>::decode_cdr2_le(&src[offset..])?;\n"
+                    "            let (elem, used) = <{rust_type}>::decode_{suffix}_le(&src[offset..])?;\n"
                 ),
             );
             dst.push_str("            offset += used;\n");
@@ -242,6 +256,7 @@ impl RustGenerator {
         field_name: &str,
         key: &IdlType,
         value: &IdlType,
+        version: CdrVersion,
     ) {
         Self::append_decode_map_prelude(dst, field_name);
 
@@ -254,7 +269,9 @@ impl RustGenerator {
         if let (Some(k), Some(v)) = (key_size, value_size) {
             Self::append_decode_map_primitives(dst, field_name, &key_type, k, &value_type, v);
         } else {
-            Self::append_decode_map_generic(dst, field_name, key, key_size, value, value_size);
+            Self::append_decode_map_generic(
+                dst, field_name, key, key_size, value, value_size, version,
+            );
         }
     }
 
@@ -315,10 +332,18 @@ impl RustGenerator {
         key_size: Option<usize>,
         value: &IdlType,
         value_size: Option<usize>,
+        version: CdrVersion,
     ) {
         dst.push_str("        for _ in 0..count {\n");
-        Self::append_decode_map_component(dst, "            ", "key_tmp", key, key_size);
-        Self::append_decode_map_component(dst, "            ", "value_tmp", value, value_size);
+        Self::append_decode_map_component(dst, "            ", "key_tmp", key, key_size, version);
+        Self::append_decode_map_component(
+            dst,
+            "            ",
+            "value_tmp",
+            value,
+            value_size,
+            version,
+        );
         push_fmt(
             dst,
             format_args!("            {field_name}.insert(key_tmp, value_tmp);\n"),
@@ -332,13 +357,14 @@ impl RustGenerator {
         var_name: &str,
         ty: &IdlType,
         fixed_size: Option<usize>,
+        version: CdrVersion,
     ) {
         if let Some(size) = fixed_size {
-            Self::append_decode_map_component_fixed(dst, indent, var_name, ty, size);
+            Self::append_decode_map_component_fixed(dst, indent, var_name, ty, size, version);
             return;
         }
 
-        Self::append_decode_map_component_dynamic(dst, indent, var_name, ty);
+        Self::append_decode_map_component_dynamic(dst, indent, var_name, ty, version);
     }
 
     fn append_decode_map_component_fixed(
@@ -347,7 +373,9 @@ impl RustGenerator {
         var_name: &str,
         ty: &IdlType,
         size: usize,
+        version: CdrVersion,
     ) {
+        let suffix = super::helpers::xcdr_method_suffix(version);
         let size_expr = size.to_string();
         Self::decode_buffer_check(dst, indent, &size_expr);
         match ty {
@@ -401,7 +429,7 @@ impl RustGenerator {
                 push_fmt(
                     dst,
                     format_args!(
-                        "{indent}let ({var_name}, used) = <{type_name}>::decode_cdr2_le(&src[offset..])?;\n"
+                        "{indent}let ({var_name}, used) = <{type_name}>::decode_{suffix}_le(&src[offset..])?;\n"
                     ),
                 );
                 push_fmt(dst, format_args!("{indent}offset += used;\n"));
@@ -414,7 +442,9 @@ impl RustGenerator {
         indent: &str,
         var_name: &str,
         ty: &IdlType,
+        version: CdrVersion,
     ) {
+        let suffix = super::helpers::xcdr_method_suffix(version);
         if let IdlType::Primitive(PrimitiveType::Fixed { digits, scale }) = ty {
             Self::decode_buffer_check(dst, indent, "16");
             push_fmt(
@@ -457,7 +487,7 @@ impl RustGenerator {
             push_fmt(
                 dst,
                 format_args!(
-                    "{indent}let ({var_name}, used) = <{type_name}>::decode_cdr2_le(&src[offset..])?;\n"
+                    "{indent}let ({var_name}, used) = <{type_name}>::decode_{suffix}_le(&src[offset..])?;\n"
                 ),
             );
             push_fmt(dst, format_args!("{indent}offset += used;\n"));
@@ -488,9 +518,7 @@ impl RustGenerator {
         );
         push_fmt(
             dst,
-            format_args!(
-                "{indent}let {target_var} = String::from_utf8(bytes.to_vec()).map_err(|_| CdrError::InvalidEncoding)?;\n"
-            ),
+            format_args!("{indent}let {target_var} = String::from_utf8(bytes.to_vec()).map_err(|_| CdrError::InvalidEncoding)?;\n"),
         );
         push_fmt(
             dst,

@@ -7,28 +7,43 @@
 
 #![allow(clippy::uninlined_format_args)]
 
-use super::{push_fmt, RustGenerator};
+use super::{push_fmt, CdrVersion, RustGenerator};
 use crate::ast::{Field, Struct};
 use crate::types::{IdlType, PrimitiveType};
 
 impl RustGenerator {
-    /// Emit `Cdr2Decode` trait implementation
-    pub(super) fn emit_cdr2_decode_impl(s: &Struct, enum_names: &[&str]) -> String {
+    /// Emit decode methods for a struct.
+    ///
+    /// All three dispatch branches now emit an inherent `pub fn decode_xcdrN_le`
+    /// method on `impl T {}`. For `@final` / default structs the top-level in
+    /// `generate_struct_with_module` calls this once per version in
+    /// [`super::helpers::VERSIONS_TO_EMIT`]. For `@mutable` / compact-mutable
+    /// structs the top-level calls it once with `CdrVersion::Xcdr2` (PL_CDR
+    /// v1 is out of scope of the WIP). The `Cdr2Decode` trait delegator is
+    /// emitted separately via [`Self::emit_cdr_trait_delegator`].
+    pub(super) fn emit_cdr2_decode_impl(
+        s: &Struct,
+        enum_names: &[&str],
+        version: CdrVersion,
+    ) -> String {
         if super::helpers::is_compact_mutable_struct(s) {
-            return Self::emit_pl_cdr2_compact_decode_impl(s);
+            return Self::emit_pl_cdr2_compact_decode_impl(s, version);
         }
 
         if super::helpers::is_mutable_struct(s) {
-            return Self::emit_pl_cdr2_decode_impl(s);
+            return Self::emit_pl_cdr2_decode_impl(s, version);
         }
 
         let mut code = String::new();
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
+        push_fmt(&mut code, format_args!("impl {} {{\n", s.name));
         push_fmt(
             &mut code,
-            format_args!("impl Cdr2Decode for {} {{\n", s.name),
+            format_args!(
+                "    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+            ),
         );
-        code.push_str("    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {\n");
         code.push_str("        let mut offset: usize = 0;\n\n");
 
         // Decode each field with alignment
@@ -37,15 +52,15 @@ impl RustGenerator {
                 continue;
             }
             if field.is_optional() {
-                code.push_str(&Self::emit_optional_field_decode(field));
+                code.push_str(&Self::emit_optional_field_decode(field, version));
             } else {
                 // Named structs self-align their internal fields, so no
-                // outer padding is needed.  Named enums serialize as a
-                // plain integer and DO need the alignment from
-                // cdr2_alignment().
+                // outer padding is needed. Named enums serialize as a
+                // plain integer and DO need the alignment from the
+                // version-aware dispatcher.
                 let alignment = match &field.field_type {
                     IdlType::Named(name) if !enum_names.contains(&name.as_str()) => 1,
-                    _ => Self::cdr2_alignment(&field.field_type),
+                    _ => Self::xcdr_alignment(&field.field_type, version),
                 };
 
                 // Insert padding if needed
@@ -66,7 +81,7 @@ impl RustGenerator {
                     code.push_str("        offset += padding;\n\n");
                 }
 
-                code.push_str(&Self::emit_decode_field(field));
+                code.push_str(&Self::emit_decode_field(field, version));
             }
         }
 
@@ -97,20 +112,20 @@ impl RustGenerator {
 
     /// Emit field decoding logic
     #[must_use]
-    fn emit_decode_field(field: &Field) -> String {
+    fn emit_decode_field(field: &Field, version: CdrVersion) -> String {
         let mut code = String::new();
-        Self::append_decode_field(&mut code, field);
+        Self::append_decode_field(&mut code, field, version);
         code
     }
 
     /// Decode an `@optional` field in standard CDR2: 1-byte presence flag + value.
     // codegen function - line count from template output
     #[allow(clippy::too_many_lines)]
-    fn emit_optional_field_decode(field: &Field) -> String {
+    fn emit_optional_field_decode(field: &Field, version: CdrVersion) -> String {
         let mut code = String::new();
         let fname = super::super::keywords::rust_ident(&field.name);
         let field_ty = Self::type_to_rust(&field.field_type);
-        let alignment = Self::cdr2_alignment(&field.field_type);
+        let alignment = Self::xcdr_alignment(&field.field_type, version);
 
         // Read presence flag and decode value in a single let-binding (avoids needless_late_init)
         Self::decode_buffer_check(&mut code, "        ", "1");
@@ -205,12 +220,14 @@ impl RustGenerator {
                 code.push_str("            Some(__hdds_s.to_string())\n");
             }
             _ => {
-                // Named, Sequence, Array, Map - delegate to Cdr2Decode
+                // Named, Sequence, Array, Map - delegate to the versioned
+                // inherent decoder emitted on the sub-type by this codegen.
                 let ty = Self::type_to_rust(&field.field_type);
+                let suffix = super::helpers::xcdr_method_suffix(version);
                 push_fmt(
                     &mut code,
                     format_args!(
-                        "            let (__hdds_val, __hdds_used) = <{ty}>::decode_cdr2_le(&src[offset..])?;\n"
+                        "            let (__hdds_val, __hdds_used) = <{ty}>::decode_{suffix}_le(&src[offset..])?;\n"
                     ),
                 );
                 code.push_str("            offset += __hdds_used;\n");
@@ -230,14 +247,21 @@ impl RustGenerator {
     /// primitive, non-optional fields (e.g., `Point3D`).
     ///
     /// Assumes layout: `[EMHEADER1][payload]...` without inner `DHEADER`.
-    fn emit_pl_cdr2_compact_decode_impl(s: &Struct) -> String {
+    ///
+    /// Always emitted as `decode_xcdr2_le`: `@mutable` XCDR1 (PL_CDR v1) is
+    /// out-of-scope of the current WIP. The `version` parameter is forced to
+    /// `Xcdr2` by the top-level dispatch in `structs.rs`.
+    fn emit_pl_cdr2_compact_decode_impl(s: &Struct, version: CdrVersion) -> String {
         let mut code = String::new();
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
+        push_fmt(&mut code, format_args!("impl {} {{\n", s.name));
         push_fmt(
             &mut code,
-            format_args!("impl Cdr2Decode for {} {{\n", s.name),
+            format_args!(
+                "    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+            ),
         );
-        code.push_str("    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {\n");
         code.push_str("        let mut offset: usize = 0;\n\n");
 
         for field in &s.fields {
@@ -304,15 +328,22 @@ impl RustGenerator {
         code
     }
 
+    /// `PL_CDR2` decoder for `@mutable` aggregated types.
+    ///
+    /// Same scope contract as [`Self::emit_pl_cdr2_compact_decode_impl`]:
+    /// `version` is expected to be `Xcdr2` (PL_CDR v1 is out of scope).
     #[allow(clippy::too_many_lines)]
-    fn emit_pl_cdr2_decode_impl(s: &Struct) -> String {
+    fn emit_pl_cdr2_decode_impl(s: &Struct, version: CdrVersion) -> String {
         let mut code = String::new();
+        let suffix = super::helpers::xcdr_method_suffix(version);
 
+        push_fmt(&mut code, format_args!("impl {} {{\n", s.name));
         push_fmt(
             &mut code,
-            format_args!("impl Cdr2Decode for {} {{\n", s.name),
+            format_args!(
+                "    pub fn decode_{suffix}_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n"
+            ),
         );
-        code.push_str("    fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {\n");
         code.push_str("        if src.len() < 4 { return Err(CdrError::UnexpectedEof); }\n");
         code.push_str("        let payload_len = {\n");
         code.push_str("            let mut tmp = [0u8; 4];\n");
@@ -361,7 +392,7 @@ impl RustGenerator {
             }
             let ident = super::super::keywords::rust_ident(&field.name);
             let member_id = Self::compute_member_id(s, idx, field);
-            let alignment = Self::cdr2_alignment(&field.field_type);
+            let alignment = Self::xcdr_alignment(&field.field_type, version);
 
             push_fmt(
                 &mut code,
@@ -379,7 +410,7 @@ impl RustGenerator {
             // Decode and compute used length by re-encoding
             match &field.field_type {
                 IdlType::Primitive(p) => {
-                    let align = Self::cdr2_alignment(&field.field_type);
+                    let align = Self::xcdr_alignment(&field.field_type, version);
                     let size = Self::cdr2_fixed_size(&field.field_type).unwrap_or(0);
                     push_fmt(
                         &mut code,
@@ -470,7 +501,7 @@ impl RustGenerator {
                             push_fmt(
                                 &mut code,
                                 format_args!(
-                                    "                        let (elem, used) = <{elem_ty}>::decode_cdr2_le(&src[offset..])?;\n"
+                                    "                        let (elem, used) = <{elem_ty}>::decode_{suffix}_le(&src[offset..])?;\n"
                                 ),
                             );
                             code.push_str("                        let advance = usize::min(elem_len, used);\n");
@@ -483,7 +514,7 @@ impl RustGenerator {
                             push_fmt(
                                 &mut code,
                                 format_args!(
-                                    "                    let (value_decoded, used) = <{ty}>::decode_cdr2_le(&src[offset..])?;\n",
+                                    "                    let (value_decoded, used) = <{ty}>::decode_{suffix}_le(&src[offset..])?;\n",
                                 ),
                             );
                             code.push_str("                    let advance = usize::min(member_end - offset, used);\n");
@@ -494,7 +525,7 @@ impl RustGenerator {
                         push_fmt(
                             &mut code,
                             format_args!(
-                                "                    let (value_decoded, used) = <{ty}>::decode_cdr2_le(&src[offset..])?;\n",
+                                "                    let (value_decoded, used) = <{ty}>::decode_{suffix}_le(&src[offset..])?;\n",
                             ),
                         );
                         code.push_str("                    let advance = usize::min(member_end - offset, used);\n");
@@ -506,7 +537,7 @@ impl RustGenerator {
                     push_fmt(
                         &mut code,
                         format_args!(
-                            "                    let (value_decoded, used) = <{ty}>::decode_cdr2_le(&src[offset..])?;\n",
+                            "                    let (value_decoded, used) = <{ty}>::decode_{suffix}_le(&src[offset..])?;\n",
                         ),
                     );
                     code.push_str("                    let advance = usize::min(member_end - offset, used);\n");
@@ -574,7 +605,7 @@ impl RustGenerator {
         code
     }
 
-    fn append_decode_field(dst: &mut String, field: &Field) {
+    fn append_decode_field(dst: &mut String, field: &Field, version: CdrVersion) {
         let ident = super::super::keywords::rust_ident(&field.name);
         match &field.field_type {
             IdlType::Primitive(p) => Self::append_decode_primitive(dst, &ident, p),
@@ -586,16 +617,16 @@ impl RustGenerator {
                 ) {
                     Self::append_decode_primitive(dst, &ident, &PrimitiveType::String);
                 } else {
-                    Self::append_decode_sequence(dst, &ident, inner);
+                    Self::append_decode_sequence(dst, &ident, inner, version);
                 }
             }
             IdlType::Array { inner, size } => {
-                Self::append_decode_array(dst, &ident, inner, *size);
+                Self::append_decode_array(dst, &ident, inner, *size, version);
             }
             IdlType::Map { key, value, .. } => {
-                Self::append_decode_map(dst, &ident, key, value);
+                Self::append_decode_map(dst, &ident, key, value, version);
             }
-            IdlType::Named(name) => Self::append_decode_named(dst, &ident, name),
+            IdlType::Named(name) => Self::append_decode_named(dst, &ident, name, version),
         }
     }
 
@@ -746,7 +777,13 @@ impl RustGenerator {
         push_fmt(dst, format_args!("        let {field_name} = ();\n\n"));
     }
 
-    fn append_decode_named(dst: &mut String, field_name: &str, type_name: &str) {
+    fn append_decode_named(
+        dst: &mut String,
+        field_name: &str,
+        type_name: &str,
+        version: CdrVersion,
+    ) {
+        let suffix = super::helpers::xcdr_method_suffix(version);
         push_fmt(
             dst,
             format_args!("        // Decode named field '{field_name}' of type '{type_name}'\n"),
@@ -754,7 +791,7 @@ impl RustGenerator {
         push_fmt(
             dst,
             format_args!(
-                "        let ({field_name}, __used) = <{type_name}>::decode_cdr2_le(&src[offset..])?;\n"
+                "        let ({field_name}, __used) = <{type_name}>::decode_{suffix}_le(&src[offset..])?;\n"
             ),
         );
         dst.push_str("        offset += __used;\n\n");
