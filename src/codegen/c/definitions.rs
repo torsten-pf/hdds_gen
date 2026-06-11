@@ -303,11 +303,14 @@ impl CGenerator {
                     String::new()
                 };
 
-                // Encode function
+                // Encode function (offset-propagating, F01-spec-correct).
+                // `offset_io` is read on entry and written on success only;
+                // on error (negative `err`) caller-visible state is undefined,
+                // per the same contract as Rust `encode_cdr2_le_at`.
                 push_fmt(
                     &mut out,
                     format_args!(
-                        "static inline int {fname}_encode_cdr2_le(const {ty}* value, uint8_t* dst, size_t len) {{\n    size_t offset = 0;\n    int err = CDR_OK;\n{c89_decls}",
+                        "static inline int {fname}_encode_cdr2_le_at(const {ty}* value, uint8_t* dst, size_t len, size_t* offset_io) {{\n    size_t offset = *offset_io;\n    int err = CDR_OK;\n{c89_decls}",
                         fname = fname,
                         ty = sdef.name,
                         c89_decls = c89_decls
@@ -324,13 +327,27 @@ impl CGenerator {
                 for field in &sdef.fields {
                     out.push_str(&emit_encode_field(field, idx, "value", c_std));
                 }
-                push_fmt(&mut out, format_args!("    return (int)offset;\n}}\n\n"));
+                push_fmt(
+                    &mut out,
+                    format_args!("    *offset_io = offset;\n    return CDR_OK;\n}}\n\n"),
+                );
 
-                // Decode function
+                // Legacy wrapper (pre-1.6.1e API). Delegates to `_at` and
+                // returns either a negative error code or the byte count.
                 push_fmt(
                     &mut out,
                     format_args!(
-                        "static inline int {fname}_decode_cdr2_le({ty}* out, const uint8_t* src, size_t len) {{\n    size_t offset = 0;\n    int err = CDR_OK;\n{c89_decls}",
+                        "static inline int {fname}_encode_cdr2_le(const {ty}* value, uint8_t* dst, size_t len) {{\n    size_t offset = 0;\n    int err = {fname}_encode_cdr2_le_at(value, dst, len, &offset);\n    if (err) {{ return err; }}\n    return (int)offset;\n}}\n\n",
+                        fname = fname,
+                        ty = sdef.name
+                    ),
+                );
+
+                // Decode function (offset-propagating, F01-spec-correct)
+                push_fmt(
+                    &mut out,
+                    format_args!(
+                        "static inline int {fname}_decode_cdr2_le_at({ty}* out, const uint8_t* src, size_t len, size_t* offset_io) {{\n    size_t offset = *offset_io;\n    int err = CDR_OK;\n{c89_decls}",
                         fname = fname,
                         ty = sdef.name,
                         c89_decls = c89_decls
@@ -347,7 +364,21 @@ impl CGenerator {
                 for field in &sdef.fields {
                     out.push_str(&emit_decode_field(field, idx, "out", c_std));
                 }
-                push_fmt(&mut out, format_args!("    return (int)offset;\n}}\n\n"));
+                push_fmt(
+                    &mut out,
+                    format_args!("    *offset_io = offset;\n    return CDR_OK;\n}}\n\n"),
+                );
+
+                // Legacy wrapper (pre-1.6.2e API). Delegates to `_at` and
+                // returns either a negative error code or the byte count.
+                push_fmt(
+                    &mut out,
+                    format_args!(
+                        "static inline int {fname}_decode_cdr2_le({ty}* out, const uint8_t* src, size_t len) {{\n    size_t offset = 0;\n    int err = {fname}_decode_cdr2_le_at(out, src, len, &offset);\n    if (err) {{ return err; }}\n    return (int)offset;\n}}\n\n",
+                        fname = fname,
+                        ty = sdef.name
+                    ),
+                );
 
                 // Max size function
                 push_fmt(
@@ -382,7 +413,7 @@ impl CGenerator {
                 push_fmt(
                     &mut out,
                     format_args!(
-                        "static inline int {fname}_encode_cdr2_le(const {ty}* value, uint8_t* dst, size_t len) {{\n    size_t offset = 0;\n    int err = CDR_OK;\n",
+                        "static inline int {fname}_encode_cdr2_le_at(const {ty}* value, uint8_t* dst, size_t len, size_t* offset_io) {{\n    size_t offset = *offset_io;\n    int err = CDR_OK;\n",
                         fname = fname,
                         ty = udef.name
                     ),
@@ -404,12 +435,26 @@ impl CGenerator {
                     "value->_d",
                     |case: &UnionCase| emit_encode_field(&case.field, idx, "(&value->_u)", c_std),
                 );
-                push_fmt(&mut out, format_args!("    return (int)offset;\n}}\n\n"));
+                push_fmt(
+                    &mut out,
+                    format_args!("    *offset_io = offset;\n    return CDR_OK;\n}}\n\n"),
+                );
 
+                // Legacy wrapper (pre-1.6.1e API).
                 push_fmt(
                     &mut out,
                     format_args!(
-                        "static inline int {fname}_decode_cdr2_le({ty}* out, const uint8_t* src, size_t len) {{\n    size_t offset = 0;\n    int err = CDR_OK;\n",
+                        "static inline int {fname}_encode_cdr2_le(const {ty}* value, uint8_t* dst, size_t len) {{\n    size_t offset = 0;\n    int err = {fname}_encode_cdr2_le_at(value, dst, len, &offset);\n    if (err) {{ return err; }}\n    return (int)offset;\n}}\n\n",
+                        fname = fname,
+                        ty = udef.name
+                    ),
+                );
+
+                // Decode function (offset-propagating, F01-spec-correct)
+                push_fmt(
+                    &mut out,
+                    format_args!(
+                        "static inline int {fname}_decode_cdr2_le_at({ty}* out, const uint8_t* src, size_t len, size_t* offset_io) {{\n    size_t offset = *offset_io;\n    int err = CDR_OK;\n",
                         fname = fname,
                         ty = udef.name
                     ),
@@ -431,7 +476,20 @@ impl CGenerator {
                     "out->_d",
                     |case: &UnionCase| emit_decode_field(&case.field, idx, "(&out->_u)", c_std),
                 );
-                push_fmt(&mut out, format_args!("    return (int)offset;\n}}\n\n"));
+                push_fmt(
+                    &mut out,
+                    format_args!("    *offset_io = offset;\n    return CDR_OK;\n}}\n\n"),
+                );
+
+                // Legacy wrapper (pre-1.6.2e API).
+                push_fmt(
+                    &mut out,
+                    format_args!(
+                        "static inline int {fname}_decode_cdr2_le({ty}* out, const uint8_t* src, size_t len) {{\n    size_t offset = 0;\n    int err = {fname}_decode_cdr2_le_at(out, src, len, &offset);\n    if (err) {{ return err; }}\n    return (int)offset;\n}}\n\n",
+                        fname = fname,
+                        ty = udef.name
+                    ),
+                );
 
                 push_fmt(
                     &mut out,

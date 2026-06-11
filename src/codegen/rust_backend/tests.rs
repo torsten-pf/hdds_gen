@@ -375,28 +375,28 @@ fn xcdr1_alignment_primitives_match_spec_table_31() {
 
     for p in &one_byte {
         assert_eq!(
-            RustGenerator::xcdr1_alignment(&IdlType::Primitive(p.clone())),
+            RustGenerator::xcdr1_alignment(&IdlType::Primitive(*p)),
             1,
             "XCDR1: {p:?} must align to 1"
         );
     }
     for p in &two_byte {
         assert_eq!(
-            RustGenerator::xcdr1_alignment(&IdlType::Primitive(p.clone())),
+            RustGenerator::xcdr1_alignment(&IdlType::Primitive(*p)),
             2,
             "XCDR1: {p:?} must align to 2"
         );
     }
     for p in &four_byte {
         assert_eq!(
-            RustGenerator::xcdr1_alignment(&IdlType::Primitive(p.clone())),
+            RustGenerator::xcdr1_alignment(&IdlType::Primitive(*p)),
             4,
             "XCDR1: {p:?} must align to 4"
         );
     }
     for p in &eight_byte {
         assert_eq!(
-            RustGenerator::xcdr1_alignment(&IdlType::Primitive(p.clone())),
+            RustGenerator::xcdr1_alignment(&IdlType::Primitive(*p)),
             8,
             "XCDR1: {p:?} must align to 8 per Table 31"
         );
@@ -416,7 +416,7 @@ fn xcdr2_alignment_caps_8_byte_primitives_at_4() {
     ];
     for p in &capped_at_4 {
         assert_eq!(
-            RustGenerator::xcdr2_alignment(&IdlType::Primitive(p.clone())),
+            RustGenerator::xcdr2_alignment(&IdlType::Primitive(*p)),
             4,
             "XCDR2: {p:?} must cap at 4 per Section 7.4.2 (not 8 as in XCDR1)"
         );
@@ -558,9 +558,12 @@ fn container_outer_xcdr1_body_invokes_sub_xcdr1_not_cdr2() -> TestResult<()> {
     let xcdr2_body = &xcdr2_rest[..xcdr2_end];
 
     // The XCDR1 body must call the XCDR1 sub-encoder, never the legacy one.
+    // Post-1.6.1a-codegen-encode: the inner call routes through the
+    // offset-aware `_at` wrapper instead of the legacy sub-buffer pattern.
     assert!(
-        xcdr1_body.contains("elem.encode_xcdr1_le("),
-        "Outer::encode_xcdr1_le should invoke elem.encode_xcdr1_le(). Body:\n{xcdr1_body}"
+        xcdr1_body.contains("elem.encode_xcdr1_le_at(dst, &mut offset)"),
+        "Outer::encode_xcdr1_le should invoke elem.encode_xcdr1_le_at(dst, &mut offset). \
+         Body:\n{xcdr1_body}"
     );
     assert!(
         !xcdr1_body.contains("encode_cdr2_le"),
@@ -569,8 +572,9 @@ fn container_outer_xcdr1_body_invokes_sub_xcdr1_not_cdr2() -> TestResult<()> {
 
     // Same contract for the XCDR2 body.
     assert!(
-        xcdr2_body.contains("elem.encode_xcdr2_le("),
-        "Outer::encode_xcdr2_le should invoke elem.encode_xcdr2_le(). Body:\n{xcdr2_body}"
+        xcdr2_body.contains("elem.encode_xcdr2_le_at(dst, &mut offset)"),
+        "Outer::encode_xcdr2_le should invoke elem.encode_xcdr2_le_at(dst, &mut offset). \
+         Body:\n{xcdr2_body}"
     );
     assert!(
         !xcdr2_body.contains("encode_cdr2_le"),
@@ -686,18 +690,22 @@ fn union_xcdr1_encode_case_named_invokes_sub_xcdr1() -> TestResult<()> {
     let xcdr2_body = &xcdr2_rest[..xcdr2_end];
 
     // Each version's case-encoding of the Inner variant must call the
-    // matching version on the sub-type.
+    // matching version on the sub-type. Post-1.6.1a-codegen-encode: the
+    // inner call routes through the offset-aware `_at` wrapper instead
+    // of the legacy sub-buffer pattern.
     assert!(
-        xcdr1_body.contains("v.encode_xcdr1_le("),
-        "TaggedInner::encode_xcdr1_le should invoke v.encode_xcdr1_le(). Body:\n{xcdr1_body}"
+        xcdr1_body.contains("v.encode_xcdr1_le_at(dst, &mut offset)"),
+        "TaggedInner::encode_xcdr1_le should invoke v.encode_xcdr1_le_at(dst, &mut offset). \
+         Body:\n{xcdr1_body}"
     );
     assert!(
         !xcdr1_body.contains("encode_cdr2_le"),
         "TaggedInner::encode_xcdr1_le must not call legacy encode_cdr2_le. Body:\n{xcdr1_body}"
     );
     assert!(
-        xcdr2_body.contains("v.encode_xcdr2_le("),
-        "TaggedInner::encode_xcdr2_le should invoke v.encode_xcdr2_le(). Body:\n{xcdr2_body}"
+        xcdr2_body.contains("v.encode_xcdr2_le_at(dst, &mut offset)"),
+        "TaggedInner::encode_xcdr2_le should invoke v.encode_xcdr2_le_at(dst, &mut offset). \
+         Body:\n{xcdr2_body}"
     );
     assert!(
         !xcdr2_body.contains("encode_cdr2_le"),
@@ -832,6 +840,323 @@ fn struct_with_xcdr1_annotation_delegator_targets_xcdr1() -> TestResult<()> {
         dec_body.contains("Self::decode_xcdr1_le(src)"),
         "ProbeV1 with @data_representation(XCDR1) must delegate decode_cdr2_le -> decode_xcdr1_le. \
          Got body:\n{dec_body}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `Cdr2Encode::encode_cdr2_le_at` REQUIRED method (DDS-XTypes v1.3
+// §7.4.3.4.1 Tab.15) emission proof
+// ---------------------------------------------------------------------------
+//
+// The trait delegator must emit `encode_cdr2_le_at` on every generated
+// `impl Cdr2Encode for T` block; the runtime trait makes the method
+// REQUIRED (no default impl) so any missing emission produces an E0046
+// error in downstream crates compiling the generated code.
+
+#[test]
+fn struct_delegator_emits_encode_cdr2_le_at() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("Probe");
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "fn encode_cdr2_le_at(\n        &self,\n        dst: &mut [u8],\n        offset: &mut usize,\n    ) -> Result<(), CdrError> {"
+        ),
+        "Probe delegator must emit encode_cdr2_le_at signature.\nGot:\n{out}"
+    );
+    let body = slice_between(
+        &out,
+        "fn encode_cdr2_le_at(\n        &self,\n        dst: &mut [u8],\n        offset: &mut usize,\n    ) -> Result<(), CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("encode_cdr2_le_at body not found in Probe delegator");
+    assert!(
+        body.contains("self.encode_xcdr2_le(&mut dst[*offset..])"),
+        "encode_cdr2_le_at must delegate to encode_xcdr2_le on Probe (no @data_representation). \
+         Got body:\n{body}"
+    );
+    assert!(
+        body.contains("*offset += len;"),
+        "encode_cdr2_le_at must advance the global offset cursor. Got body:\n{body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn xcdr1_struct_delegator_routes_encode_cdr2_le_at_to_xcdr1() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("ProbeV1");
+    s.add_annotation(Annotation::DataRepresentation("XCDR1".into()));
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    let body = slice_between(
+        &out,
+        "fn encode_cdr2_le_at(\n        &self,\n        dst: &mut [u8],\n        offset: &mut usize,\n    ) -> Result<(), CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("encode_cdr2_le_at body not found in ProbeV1 delegator");
+    assert!(
+        body.contains("self.encode_xcdr1_le(&mut dst[*offset..])"),
+        "ProbeV1 with @data_representation(XCDR1) must delegate encode_cdr2_le_at \
+         -> encode_xcdr1_le. Got body:\n{body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dds_keyhash_cdr2_path_uses_encode_cdr2_le_at() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut nested = Struct::new("Nested");
+    nested.add_field(Field::new("v", IdlType::Primitive(PrimitiveType::Long)));
+    file.add_definition(Definition::Struct(nested));
+
+    let mut outer = Struct::new("Outer");
+    let mut key_field = Field::new("k", IdlType::Named("Nested".into()));
+    key_field.annotations.push(Annotation::Key);
+    outer.add_field(key_field);
+    file.add_definition(Definition::Struct(outer));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains("let mut _kbuf = [0u8; 4096];"),
+        "KeyHashKind::Cdr2 path must allocate _kbuf scratch buffer.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("let mut _koffset: usize = 0;"),
+        "KeyHashKind::Cdr2 path must initialize _koffset cursor for offset propagation.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("self.k.encode_cdr2_le_at(&mut _kbuf, &mut _koffset).is_ok()"),
+        "KeyHashKind::Cdr2 path must call encode_cdr2_le_at (DDS-XTypes v1.3 \
+         §7.4.3.4.1 Tab.15) on the key field, not legacy encode_cdr2_le.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("for &b in &_kbuf[.._koffset]"),
+        "KeyHashKind::Cdr2 path must hash up to the cursor position (_koffset), \
+         not a separately tracked length.\nGot:\n{out}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `Cdr2Decode::decode_cdr2_le_at` REQUIRED method (DDS-XTypes v1.3
+// §7.4.3.4.1 Tab.15) emission proof — symmetric to the encode-side
+// lock tests above. Added in 1.6.2a-codegen-rust.
+// ---------------------------------------------------------------------------
+//
+// The trait delegator must emit `decode_cdr2_le_at` on every generated
+// `impl Cdr2Decode for T` block; the runtime trait makes the method
+// REQUIRED (no default impl) so any missing emission produces an E0046
+// error in downstream crates compiling the generated code.
+
+#[test]
+fn struct_delegator_emits_decode_cdr2_le_at() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("Probe");
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "fn decode_cdr2_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {"
+        ),
+        "Probe delegator must emit decode_cdr2_le_at signature.\nGot:\n{out}"
+    );
+    let body = slice_between(
+        &out,
+        "fn decode_cdr2_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("decode_cdr2_le_at body not found in Probe delegator");
+    assert!(
+        body.contains("Self::decode_xcdr2_le(&src[*offset..])"),
+        "decode_cdr2_le_at must delegate to decode_xcdr2_le on Probe (no @data_representation). \
+         Got body:\n{body}"
+    );
+    assert!(
+        body.contains("*offset += used;"),
+        "decode_cdr2_le_at must advance the global offset cursor. Got body:\n{body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn xcdr1_struct_delegator_routes_decode_cdr2_le_at_to_xcdr1() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("ProbeV1");
+    s.add_annotation(Annotation::DataRepresentation("XCDR1".into()));
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    let body = slice_between(
+        &out,
+        "fn decode_cdr2_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("decode_cdr2_le_at body not found in ProbeV1 delegator");
+    assert!(
+        body.contains("Self::decode_xcdr1_le(&src[*offset..])"),
+        "ProbeV1 with @data_representation(XCDR1) must delegate decode_cdr2_le_at \
+         -> decode_xcdr1_le. Got body:\n{body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn struct_inherent_emits_decode_xcdr1_le_at_wrapper() -> TestResult<()> {
+    // Symmetric with the xcdr2 inherent test below: an @data_representation(XCDR1)
+    // struct must emit the inherent `pub fn decode_xcdr1_le_at` wrapper next
+    // to the legacy `decode_xcdr1_le`, so an outer XCDR1 decoder can call
+    // `Inner::decode_xcdr1_le_at(src, &mut offset)` directly.
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("ProbeV1");
+    s.add_annotation(Annotation::DataRepresentation("XCDR1".into()));
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "pub fn decode_xcdr1_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {"
+        ),
+        "ProbeV1 inherent impl must emit decode_xcdr1_le_at wrapper.\nGot:\n{out}"
+    );
+    let body = slice_between(
+        &out,
+        "pub fn decode_xcdr1_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("decode_xcdr1_le_at wrapper body not found");
+    assert!(
+        body.contains("Self::decode_xcdr1_le(&src[*offset..])"),
+        "decode_xcdr1_le_at wrapper must delegate to decode_xcdr1_le on a sub-slice. \
+         Got body:\n{body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn struct_inherent_emits_decode_xcdr2_le_at_wrapper() -> TestResult<()> {
+    // The inherent `impl Probe { ... }` block must include a
+    // `decode_{suffix}_le_at` wrapper next to the legacy `decode_{suffix}_le`
+    // so outer decoders can use the offset-aware call pattern
+    // `Inner::decode_xcdr2_le_at(src, &mut offset)` directly.
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("Probe");
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "pub fn decode_xcdr2_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {"
+        ),
+        "Probe inherent impl must emit decode_xcdr2_le_at wrapper.\nGot:\n{out}"
+    );
+    let body = slice_between(
+        &out,
+        "pub fn decode_xcdr2_le_at(\n        src: &[u8],\n        offset: &mut usize,\n    ) -> Result<Self, CdrError> {\n",
+        "\n    }\n",
+    )
+    .expect("decode_xcdr2_le_at wrapper body not found");
+    assert!(
+        body.contains("Self::decode_xcdr2_le(&src[*offset..])"),
+        "decode_xcdr2_le_at wrapper must delegate to decode_xcdr2_le on a sub-slice. \
+         Got body:\n{body}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+//
+// `emit_dds_trait_impl` emits `fn encode(&self, buf, version)` and
+// `fn decode(buf, version)` on `impl ::hdds::api::DDS for T` that dispatch
+// on `::hdds::CdrVersion` to the inherent methods `encode_xcdr{1,2}_le` /
+// `decode_xcdr{1,2}_le`. Lock both match arms so the trait-level dispatch
+// stays aligned with the dual-emission inherents.
+
+#[test]
+fn dds_trait_impl_encode_dispatches_on_cdr_version() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("Probe");
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "fn encode(&self, buf: &mut [u8], version: ::hdds::CdrVersion) -> ::hdds::api::Result<usize>"
+        ),
+        "DDS trait impl must emit the CdrVersion-parametrized encode signature. Got:\n{out}"
+    );
+    assert!(
+        out.contains("::hdds::CdrVersion::Xcdr1 => self.encode_xcdr1_le(buf).map_err(Into::into)"),
+        "DDS::encode must dispatch Xcdr1 to encode_xcdr1_le. Got:\n{out}"
+    );
+    assert!(
+        out.contains("::hdds::CdrVersion::Xcdr2 => self.encode_xcdr2_le(buf).map_err(Into::into)"),
+        "DDS::encode must dispatch Xcdr2 to encode_xcdr2_le. Got:\n{out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dds_trait_impl_decode_dispatches_on_cdr_version() -> TestResult<()> {
+    let mut file = IdlFile::new();
+    let mut s = Struct::new("Probe");
+    s.add_field(Field::new("a", IdlType::Primitive(PrimitiveType::Octet)));
+    s.add_field(Field::new("b", IdlType::Primitive(PrimitiveType::Double)));
+    file.add_definition(Definition::Struct(s));
+
+    let r#gen = RustGenerator::new();
+    let out = r#gen.generate(&file)?;
+
+    assert!(
+        out.contains(
+            "fn decode(buf: &[u8], version: ::hdds::CdrVersion) -> ::hdds::api::Result<Self>"
+        ),
+        "DDS trait impl must emit the CdrVersion-parametrized decode signature. Got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "::hdds::CdrVersion::Xcdr1 => Self::decode_xcdr1_le(buf).map(|(val, _)| val).map_err(Into::into)"
+        ),
+        "DDS::decode must dispatch Xcdr1 to decode_xcdr1_le. Got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "::hdds::CdrVersion::Xcdr2 => Self::decode_xcdr2_le(buf).map(|(val, _)| val).map_err(Into::into)"
+        ),
+        "DDS::decode must dispatch Xcdr2 to decode_xcdr2_le. Got:\n{out}"
     );
     Ok(())
 }

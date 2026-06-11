@@ -176,6 +176,16 @@ impl RustGenerator {
             );
             push_fmt(
                 &mut code,
+                format_args!(
+                    "{indent}        if dst.len() < offset + padding {{ return Err(CdrError::BufferTooSmall); }}\n"
+                ),
+            );
+            push_fmt(
+                &mut code,
+                format_args!("{indent}        dst[offset..offset+padding].fill(0);\n"),
+            );
+            push_fmt(
+                &mut code,
                 format_args!("{indent}        offset += padding;\n\n"),
             );
         }
@@ -248,6 +258,7 @@ impl RustGenerator {
             ),
         );
         push_fmt(&mut code, format_args!("{indent}    }}\n"));
+        code.push_str(&Self::emit_encode_at_wrapper(suffix, indent));
         push_fmt(&mut code, format_args!("{indent}}}\n\n"));
 
         code
@@ -360,6 +371,7 @@ impl RustGenerator {
 
         push_fmt(&mut code, format_args!("{indent}        }}\n"));
         push_fmt(&mut code, format_args!("{indent}    }}\n"));
+        code.push_str(&Self::emit_decode_at_wrapper(suffix, indent));
         push_fmt(&mut code, format_args!("{indent}}}\n\n"));
 
         code
@@ -546,6 +558,16 @@ impl RustGenerator {
             );
             push_fmt(
                 &mut code,
+                format_args!(
+                    "{indent}                if dst.len() < offset + padding {{ return Err(CdrError::BufferTooSmall); }}\n"
+                ),
+            );
+            push_fmt(
+                &mut code,
+                format_args!("{indent}                dst[offset..offset+padding].fill(0);\n"),
+            );
+            push_fmt(
+                &mut code,
                 format_args!("{indent}                offset += padding;\n\n"),
             );
         }
@@ -564,12 +586,8 @@ impl RustGenerator {
                 push_fmt(
                     &mut code,
                     format_args!(
-                        "{indent}                let n = {var}.encode_{suffix}_le(&mut dst[offset..])?;\n"
+                        "{indent}                {var}.encode_{suffix}_le_at(dst, &mut offset)?;\n"
                     ),
-                );
-                push_fmt(
-                    &mut code,
-                    format_args!("{indent}                offset += n;\n"),
                 );
             }
             IdlType::Sequence { inner, .. } => {
@@ -595,12 +613,8 @@ impl RustGenerator {
                     &mut code,
                     format_args!("{indent}                for item in {var}.iter() {{\n"),
                 );
-                let inner_encode = Self::emit_union_value_encode(
-                    inner,
-                    "item",
-                    &format!("{indent}    "),
-                    version,
-                );
+                let inner_encode =
+                    Self::emit_union_value_encode(inner, "item", &format!("{indent}    "), version);
                 code.push_str(&inner_encode);
                 push_fmt(&mut code, format_args!("{indent}                }}\n"));
             }
@@ -664,16 +678,14 @@ impl RustGenerator {
             }
             IdlType::Named(name) => {
                 // Same 2.2-c critical fix as `emit_union_value_encode`: route
-                // the sub-type decoder on the outer's XCDR version.
+                // the sub-type decoder on the outer's XCDR version. Uses the
+                // offset-aware `_at` API so the cursor propagates uniformly
+                // through nested types.
                 push_fmt(
                     &mut code,
                     format_args!(
-                        "{indent}                let (val, n) = {name}::decode_{suffix}_le(&src[offset..])?;\n"
+                        "{indent}                let val = {name}::decode_{suffix}_le_at(src, &mut offset)?;\n"
                     ),
-                );
-                push_fmt(
-                    &mut code,
-                    format_args!("{indent}                offset += n;\n"),
                 );
             }
             IdlType::Sequence { inner, .. } => {

@@ -21,7 +21,9 @@ fn loop_var(depth: u32) -> &'static str {
 /// Returns true if any case field has a non-trivial C++ type that cannot
 /// live inside an anonymous union without explicit constructors/destructors.
 fn has_nontrivial_case(u: &Union, idx: &DefinitionIndex) -> bool {
-    u.cases.iter().any(|c| is_nontrivial_type(&c.field.field_type, idx))
+    u.cases
+        .iter()
+        .any(|c| is_nontrivial_type(&c.field.field_type, idx))
 }
 
 fn is_nontrivial_type(ty: &IdlType, idx: &DefinitionIndex) -> bool {
@@ -137,14 +139,39 @@ fn write_union_codec(
         push_fmt(out, format_args!("{indent}    }} _u;\n\n"));
     }
 
-    // encode_cdr2_le method
+    // encode_cdr2_le_at method (offset-propagating, F01-spec-correct)
     push_fmt(
         out,
-        format_args!("{member_indent}/// Encode this union to CDR2 little-endian format\n"),
+        format_args!(
+            "{member_indent}/// Encode this union to CDR2 little-endian format, propagating offset.\n"
+        ),
     );
     push_fmt(
         out,
-        format_args!("{member_indent}/// Returns the number of bytes written, or -1 on error\n"),
+        format_args!("{member_indent}/// Returns 0 on success, negative error code on failure.\n"),
+    );
+    push_fmt(
+        out,
+        format_args!(
+            "{member_indent}[[nodiscard]] int encode_cdr2_le_at(std::uint8_t* dst, std::size_t len, std::size_t& offset) const noexcept {{\n"
+        ),
+    );
+
+    // Encode discriminator
+    out.push_str(&emit_encode_discriminator(&u.discriminator, &body_indent));
+
+    // Switch on discriminator to encode the appropriate field
+    out.push_str(&emit_encode_switch(u, idx, &body_indent, nontrivial));
+
+    push_fmt(out, format_args!("{body_indent}return 0;\n"));
+    push_fmt(out, format_args!("{member_indent}}}\n\n"));
+
+    // Legacy wrapper (pre-1.6.1e API)
+    push_fmt(
+        out,
+        format_args!(
+            "{member_indent}/// Legacy: returns the number of bytes written, or -1 on error.\n"
+        ),
     );
     push_fmt(
         out,
@@ -153,27 +180,50 @@ fn write_union_codec(
         ),
     );
     push_fmt(out, format_args!("{body_indent}std::size_t offset = 0;\n"));
-
-    // Encode discriminator
-    out.push_str(&emit_encode_discriminator(&u.discriminator, &body_indent));
-
-    // Switch on discriminator to encode the appropriate field
-    out.push_str(&emit_encode_switch(u, idx, &body_indent, nontrivial));
-
+    push_fmt(
+        out,
+        format_args!("{body_indent}int err = encode_cdr2_le_at(dst, len, offset);\n"),
+    );
+    push_fmt(out, format_args!("{body_indent}if (err) return err;\n"));
     push_fmt(
         out,
         format_args!("{body_indent}return static_cast<int>(offset);\n"),
     );
     push_fmt(out, format_args!("{member_indent}}}\n\n"));
 
-    // decode_cdr2_le method
+    // decode_cdr2_le_at method (offset-propagating, F01-spec-correct)
     push_fmt(
         out,
-        format_args!("{member_indent}/// Decode this union from CDR2 little-endian format\n"),
+        format_args!(
+            "{member_indent}/// Decode this union from CDR2 little-endian format, propagating offset.\n"
+        ),
     );
     push_fmt(
         out,
-        format_args!("{member_indent}/// Returns the number of bytes read, or -1 on error\n"),
+        format_args!("{member_indent}/// Returns 0 on success, negative error code on failure.\n"),
+    );
+    push_fmt(
+        out,
+        format_args!(
+            "{member_indent}[[nodiscard]] int decode_cdr2_le_at(const std::uint8_t* src, std::size_t len, std::size_t& offset) noexcept {{\n"
+        ),
+    );
+
+    // Decode discriminator
+    out.push_str(&emit_decode_discriminator(&u.discriminator, &body_indent));
+
+    // Switch on discriminator to decode the appropriate field
+    out.push_str(&emit_decode_switch(u, idx, &body_indent, nontrivial));
+
+    push_fmt(out, format_args!("{body_indent}return 0;\n"));
+    push_fmt(out, format_args!("{member_indent}}}\n\n"));
+
+    // Legacy wrapper (pre-1.6.2e API)
+    push_fmt(
+        out,
+        format_args!(
+            "{member_indent}/// Legacy: returns the number of bytes read, or negative on error.\n"
+        ),
     );
     push_fmt(
         out,
@@ -182,13 +232,11 @@ fn write_union_codec(
         ),
     );
     push_fmt(out, format_args!("{body_indent}std::size_t offset = 0;\n"));
-
-    // Decode discriminator
-    out.push_str(&emit_decode_discriminator(&u.discriminator, &body_indent));
-
-    // Switch on discriminator to decode the appropriate field
-    out.push_str(&emit_decode_switch(u, idx, &body_indent, nontrivial));
-
+    push_fmt(
+        out,
+        format_args!("{body_indent}int err = decode_cdr2_le_at(src, len, offset);\n"),
+    );
+    push_fmt(out, format_args!("{body_indent}if (err) return err;\n"));
     push_fmt(
         out,
         format_args!("{body_indent}return static_cast<int>(offset);\n"),
@@ -199,7 +247,7 @@ fn write_union_codec(
 fn emit_encode_discriminator(disc: &IdlType, indent: &str) -> String {
     let (align, size) = discriminator_layout(disc);
     format!(
-        "{indent}offset = cdr2::align_offset(offset, {align});\n\
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, {align})) return -1;\n\
          {indent}if (!cdr2::can_write(len, offset, {size})) return -1;\n\
          {indent}std::memcpy(dst + offset, &(this->_d), {size});\n\
          {indent}offset += {size};\n"
@@ -236,10 +284,11 @@ fn discriminator_layout(disc: &IdlType) -> (usize, usize) {
             | PrimitiveType::Int32
             | PrimitiveType::UnsignedLong
             | PrimitiveType::UInt32 => (4, 4),
+            // XCDR2 §7.4.3.4.1 Tab.15: 8-byte primitives align on 4 (cap-4).
             PrimitiveType::LongLong
             | PrimitiveType::Int64
             | PrimitiveType::UnsignedLongLong
-            | PrimitiveType::UInt64 => (8, 8),
+            | PrimitiveType::UInt64 => (4, 8),
             _ => (4, 4), // Default for enums and other types
         },
         IdlType::Named(_)
@@ -424,18 +473,19 @@ fn emit_encode_type(
         IdlType::Named(nm) => {
             let type_ident = last_ident(nm);
             if idx.structs.contains_key(type_ident) || idx.unions.contains_key(type_ident) {
+                // F01-spec-correct: propagate global offset via `_at` API.
                 format!(
                     "{indent}{{\n\
-                     {indent}    int bytes = {value_expr}.encode_cdr2_le(dst + offset, len - offset);\n\
-                     {indent}    if (bytes < 0) return -1;\n\
-                     {indent}    offset += static_cast<std::size_t>(bytes);\n\
+                     {indent}    int err = {value_expr}.encode_cdr2_le_at(dst, len, offset);\n\
+                     {indent}    if (err) return err;\n\
                      {indent}}}\n"
                 )
             } else if idx.bitsets.contains_key(type_ident) || idx.bitmasks.contains_key(type_ident)
             {
+                // XCDR2 §7.4.3.4.1 Tab.15: 8-byte primitives align on 4 (cap-4).
                 encode_scalar(
                     indent,
-                    8,
+                    4,
                     8,
                     &format!("static_cast<std::uint64_t>({value_expr})"),
                 )
@@ -487,19 +537,23 @@ fn emit_decode_type(
         IdlType::Named(nm) => {
             let type_ident = last_ident(nm);
             if idx.structs.contains_key(type_ident) || idx.unions.contains_key(type_ident) {
+                // F01-spec-correct: propagate global offset via `_at` API
+                // instead of slicing the source buffer (which loses the outer
+                // alignment context inside the callee). Mirrors the encode
+                // side migration that landed in hddsgen 1.6.1e.
                 format!(
                     "{indent}{{\n\
-                     {indent}    int bytes = {value_expr}.decode_cdr2_le(src + offset, len - offset);\n\
-                     {indent}    if (bytes < 0) return -1;\n\
-                     {indent}    offset += static_cast<std::size_t>(bytes);\n\
+                     {indent}    int err = {value_expr}.decode_cdr2_le_at(src, len, offset);\n\
+                     {indent}    if (err) return err;\n\
                      {indent}}}\n"
                 )
             } else if idx.bitsets.contains_key(type_ident) || idx.bitmasks.contains_key(type_ident)
             {
+                // XCDR2 §7.4.3.4.1 Tab.15: 8-byte primitives align on 4 (cap-4).
                 let mut out = String::new();
                 let _ = write!(
                     out,
-                    "{indent}offset = cdr2::align_offset(offset, 8);\n\
+                    "{indent}offset = cdr2::align_offset(offset, 4);\n\
                      {indent}if (!cdr2::can_read(len, offset, 8)) return -1;\n\
                      {indent}{{\n\
                      {indent}    std::uint64_t tmp;\n\
@@ -552,19 +606,24 @@ fn primitive_scalar_layout(prim: &crate::types::PrimitiveType) -> Option<(usize,
         | PrimitiveType::UInt32
         | PrimitiveType::Float
         | PrimitiveType::WChar => Some((4, 4)),
+        // XCDR2 §7.4.3.4.1 Tab.15: 8-byte primitives align on 4 (cap-4).
         PrimitiveType::LongLong
         | PrimitiveType::Int64
         | PrimitiveType::UnsignedLongLong
         | PrimitiveType::UInt64
         | PrimitiveType::Double
-        | PrimitiveType::LongDouble => Some((8, 8)),
+        | PrimitiveType::LongDouble => Some((4, 8)),
         PrimitiveType::Fixed { .. } => Some((4, 16)),
         PrimitiveType::String | PrimitiveType::WString | PrimitiveType::Void => None,
     }
 }
 
 fn encode_scalar(indent: &str, align: usize, size: usize, value_expr: &str) -> String {
-    if value_expr.contains("static_cast") {
+    // Heuristic mirrors `cpp/codec/encode.rs::encode_scalar`: a value
+    // expression that is a call (`ends_with(')')`) cannot have its address
+    // taken safely with `&(expr)` — route through a temp variable. Keep both
+    // implementations in sync to avoid latent rvalue-address bugs.
+    if value_expr.contains("static_cast") || value_expr.ends_with(')') {
         let type_name = match size {
             1 => "std::uint8_t",
             2 => "std::uint16_t",
@@ -572,7 +631,7 @@ fn encode_scalar(indent: &str, align: usize, size: usize, value_expr: &str) -> S
             _ => "std::uint64_t",
         };
         format!(
-            "{indent}offset = cdr2::align_offset(offset, {align});\n\
+            "{indent}if (!cdr2::pad_to_align(dst, offset, len, {align})) return -1;\n\
              {indent}if (!cdr2::can_write(len, offset, {size})) return -1;\n\
              {indent}{{\n\
              {indent}    {type_name} tmp = {value_expr};\n\
@@ -582,7 +641,7 @@ fn encode_scalar(indent: &str, align: usize, size: usize, value_expr: &str) -> S
         )
     } else {
         format!(
-            "{indent}offset = cdr2::align_offset(offset, {align});\n\
+            "{indent}if (!cdr2::pad_to_align(dst, offset, len, {align})) return -1;\n\
              {indent}if (!cdr2::can_write(len, offset, {size})) return -1;\n\
              {indent}std::memcpy(dst + offset, &({value_expr}), {size});\n\
              {indent}offset += {size};\n"
@@ -601,7 +660,7 @@ fn decode_scalar(indent: &str, align: usize, size: usize, value_expr: &str) -> S
 
 fn encode_string(indent: &str, value_expr: &str) -> String {
     format!(
-        "{indent}offset = cdr2::align_offset(offset, 4);\n\
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;\n\
          {indent}{{\n\
          {indent}    std::uint32_t str_len = static_cast<std::uint32_t>({value_expr}.size() + 1);\n\
          {indent}    if (!cdr2::can_write(len, offset, 4 + str_len)) return -1;\n\
@@ -630,7 +689,7 @@ fn decode_string(indent: &str, value_expr: &str) -> String {
 
 fn encode_wstring(indent: &str, value_expr: &str) -> String {
     format!(
-        "{indent}offset = cdr2::align_offset(offset, 4);\n\
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;\n\
          {indent}{{\n\
          {indent}    std::uint32_t byte_len = static_cast<std::uint32_t>(({value_expr}.size() + 1) * sizeof(wchar_t));\n\
          {indent}    if (!cdr2::can_write(len, offset, 4 + byte_len)) return -1;\n\
@@ -660,7 +719,7 @@ fn decode_wstring(indent: &str, value_expr: &str) -> String {
 
 fn encode_wchar(indent: &str, value_expr: &str) -> String {
     format!(
-        "{indent}offset = cdr2::align_offset(offset, 4);\n\
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;\n\
          {indent}if (!cdr2::can_write(len, offset, 4)) return -1;\n\
          {indent}{{\n\
          {indent}    std::uint32_t wc = static_cast<std::uint32_t>({value_expr});\n\
@@ -687,7 +746,7 @@ fn decode_wchar(indent: &str, value_expr: &str) -> String {
 
 fn encode_fixed(indent: &str, value_expr: &str) -> String {
     format!(
-        "{indent}offset = cdr2::align_offset(offset, 4);\n\
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;\n\
          {indent}if (!cdr2::can_write(len, offset, 16)) return -1;\n\
          {indent}{{\n\
          {indent}    auto bytes = {value_expr}.to_le_bytes();\n\
@@ -722,8 +781,14 @@ fn encode_array(
     let mut out = String::new();
     let var = loop_var(depth);
     let align = idx.align_of(inner);
-    let _ = writeln!(out, "{indent}offset = cdr2::align_offset(offset, {align});");
-    let _ = writeln!(out, "{indent}for (std::size_t {var} = 0; {var} < {size}; ++{var}) {{");
+    let _ = writeln!(
+        out,
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, {align})) return -1;"
+    );
+    let _ = writeln!(
+        out,
+        "{indent}for (std::size_t {var} = 0; {var} < {size}; ++{var}) {{"
+    );
     let next_indent = format!("{indent}    ");
     let element_value = format!("{value_expr}[{var}]");
     out.push_str(&emit_encode_type(
@@ -751,7 +816,10 @@ fn decode_array(
     let var = loop_var(depth);
     let align = idx.align_of(inner);
     let _ = writeln!(out, "{indent}offset = cdr2::align_offset(offset, {align});");
-    let _ = writeln!(out, "{indent}for (std::size_t {var} = 0; {var} < {size}; ++{var}) {{");
+    let _ = writeln!(
+        out,
+        "{indent}for (std::size_t {var} = 0; {var} < {size}; ++{var}) {{"
+    );
     let next_indent = format!("{indent}    ");
     let element_value = format!("{value_expr}[{var}]");
     out.push_str(&emit_decode_type(
@@ -776,7 +844,10 @@ fn encode_sequence(
 ) -> String {
     let mut out = String::new();
     let var = loop_var(depth);
-    let _ = writeln!(out, "{indent}offset = cdr2::align_offset(offset, 4);");
+    let _ = writeln!(
+        out,
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;"
+    );
     let _ = write!(
         out,
         "{indent}{{\n\
@@ -886,7 +957,10 @@ fn encode_map(
     depth: u32,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "{indent}offset = cdr2::align_offset(offset, 4);");
+    let _ = writeln!(
+        out,
+        "{indent}if (!cdr2::pad_to_align(dst, offset, len, 4)) return -1;"
+    );
     let _ = write!(
         out,
         "{indent}{{\n\

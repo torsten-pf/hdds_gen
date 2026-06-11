@@ -406,6 +406,36 @@ impl RustGenerator {
     /// XCDR v2 encoders. The target of the delegation is the type's
     /// `@data_representation` annotation (`@XCDR1` -> Xcdr1, otherwise Xcdr2).
     ///
+    /// `encode_cdr2_le_at` and `decode_cdr2_le_at` are REQUIRED methods on
+    /// the HDDS `Cdr2Encode` / `Cdr2Decode` traits (chantier 1.6.1-1.6.2
+    /// migration). They are the offset-propagating entry points that the
+    /// HDDS runtime uses to keep alignment consistent through nested types;
+    /// the spec itself (DDS-XTypes v1.3 §7.4.3.4) describes the wire-level
+    /// alignment rules but does not prescribe the API surface — the `_at`
+    /// suffix and its REQUIRED status are an HDDS convention, not a spec
+    /// mandate. Both bodies are trivial wrappers that call the legacy
+    /// `_le` method on a sub-slice and advance the global cursor by the
+    /// returned length. This routes to the inherent `(en|de)code_xcdrN_le`,
+    /// which is the actual codec body. The inherent `(en|de)code_xcdrN_le_at`
+    /// emitted by `RustGenerator::emit_{encode,decode}_at_wrapper` are
+    /// parallel trivial wrappers — so calling either trait method or
+    /// inherent `_at` ultimately reaches the same codec body via a
+    /// one-step sub-buffer slice.
+    ///
+    /// Inner-field call sites in struct/union/container templates use the
+    /// offset-aware inherent `(en|de)code_xcdrN_le_at` so the global cursor
+    /// propagates uniformly through nested types at the call-site level.
+    /// Sub-buffer slicing is now confined to two trivial wrappers per
+    /// direction (the trait delegator emitted here and the inherent `_at`
+    /// wrapper) plus `Fixed<D, S>`'s manually-inlined version of the same
+    /// pattern.
+    ///
+    /// The inherent codec bodies (`(en|de)code_xcdrN_le`) still compute
+    /// alignment from a local `offset` cursor that starts at 0; lifting
+    /// those bodies onto the global cursor (making the body operate on
+    /// `*offset` directly) is a deeper refactor that closes the residual
+    /// F01 surface for non-aligned outer offsets and is tracked separately.
+    ///
     /// This is shared between struct and union codegen (2.2-a emits for
     /// structs, 2.2-c will emit for unions).
     pub(super) fn emit_cdr_trait_delegator(name: &str, primary: CdrVersion) -> String {
@@ -419,11 +449,30 @@ impl RustGenerator {
              \u{20}   fn max_cdr2_size(&self) -> usize {{\n\
              \u{20}       self.max_{suffix}_size()\n\
              \u{20}   }}\n\
+             \n\
+             \u{20}   fn encode_cdr2_le_at(\n\
+             \u{20}       &self,\n\
+             \u{20}       dst: &mut [u8],\n\
+             \u{20}       offset: &mut usize,\n\
+             \u{20}   ) -> Result<(), CdrError> {{\n\
+             \u{20}       let len = self.encode_{suffix}_le(&mut dst[*offset..])?;\n\
+             \u{20}       *offset += len;\n\
+             \u{20}       Ok(())\n\
+             \u{20}   }}\n\
              }}\n\
              \n\
              impl Cdr2Decode for {name} {{\n\
              \u{20}   fn decode_cdr2_le(src: &[u8]) -> Result<(Self, usize), CdrError> {{\n\
              \u{20}       Self::decode_{suffix}_le(src)\n\
+             \u{20}   }}\n\
+             \n\
+             \u{20}   fn decode_cdr2_le_at(\n\
+             \u{20}       src: &[u8],\n\
+             \u{20}       offset: &mut usize,\n\
+             \u{20}   ) -> Result<Self, CdrError> {{\n\
+             \u{20}       let (value, used) = Self::decode_{suffix}_le(&src[*offset..])?;\n\
+             \u{20}       *offset += used;\n\
+             \u{20}       Ok(value)\n\
              \u{20}   }}\n\
              }}\n\
              \n"
